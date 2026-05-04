@@ -73,7 +73,14 @@ def require_admin(credentials: HTTPAuthorizationCredentials | None = Depends(_be
 # CORS — in produzione restringere a domini frontend reali
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[settings.base_url, "http://localhost:5173", "http://localhost:8000"],
+    allow_origins=[
+        settings.base_url,
+        "https://nutriscienza.org",
+        "https://www.nutriscienza.org",
+        "https://nutriscienza-frontend.onrender.com",
+        "http://localhost:5173",
+        "http://localhost:8000",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
