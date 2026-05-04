@@ -63,11 +63,11 @@ def _email_html(intake: IntakeRequest) -> str:
       <hr style="border:none;border-top:1px solid #E5E0D3;margin:28px 0 18px;">
       <p style="font-size:12px;color:#6B6B6B;line-height:1.5;">
         Questo piano ha finalità educative e non sostituisce il parere di un medico in presenza di
-        patologie. Sviluppato con biologi nutrizionisti iscritti all'Ordine.
+        patologie.
       </p>
     </div>
     <div style="background:#1A2E22;padding:18px 36px;color:rgba(255,255,255,0.7);font-size:12px;">
-      © NutriScienza S.r.l. · <a href="{settings.base_url}" style="color:#C9A66B;text-decoration:none;">nutriscienza.org</a>
+      © NutriScienza · <a href="{settings.base_url}" style="color:#C9A66B;text-decoration:none;">nutriscienza.org</a>
     </div>
   </div>
 </body>
@@ -150,11 +150,11 @@ def _refresh_email_html(first_name: str, plan: str, plan_month: int, checkin_url
       <hr style="border:none;border-top:1px solid #E5E0D3;margin:28px 0 18px;">
       <p style="font-size:12px;color:#6B6B6B;line-height:1.5;">
         Questo piano ha finalità educative e non sostituisce il parere di un medico in presenza di
-        patologie. Sviluppato con biologi nutrizionisti iscritti all'Ordine.
+        patologie.
       </p>
     </div>
     <div style="background:#1A2E22;padding:18px 36px;color:rgba(255,255,255,0.7);font-size:12px;">
-      © NutriScienza S.r.l. · <a href="{settings.base_url}" style="color:#C9A66B;text-decoration:none;">nutriscienza.org</a>
+      © NutriScienza · <a href="{settings.base_url}" style="color:#C9A66B;text-decoration:none;">nutriscienza.org</a>
     </div>
   </div>
 </body>
@@ -230,7 +230,7 @@ def send_cancellation_email(email: str, first_name: str, plan: str) -> None:
       </p>
     </div>
     <div style="background:#1A2E22;padding:18px 36px;color:rgba(255,255,255,0.7);font-size:12px;">
-      © NutriScienza S.r.l. · <a href="{settings.base_url}" style="color:#C9A66B;text-decoration:none;">nutriscienza.org</a>
+      © NutriScienza · <a href="{settings.base_url}" style="color:#C9A66B;text-decoration:none;">nutriscienza.org</a>
     </div>
   </div>
 </body>

@@ -90,7 +90,7 @@ def _make_header_footer(plan_label: str, customer_name: str):
         canv.line(2 * cm, 1.6 * cm, width - 2 * cm, 1.6 * cm)
         canv.setFont("Helvetica", 8)
         canv.setFillColor(TEXT_MUTED)
-        canv.drawString(2 * cm, 1 * cm, "© NutriScienza S.r.l. — Conforme alle linee guida LARN")
+        canv.drawString(2 * cm, 1 * cm, "© NutriScienza — Conforme alle linee guida LARN")
         canv.drawRightString(width - 2 * cm, 1 * cm, f"Pagina {doc.page}")
         canv.restoreState()
     return fn
@@ -168,7 +168,7 @@ def _make_cover_page(intake: IntakeRequest, plan_label: str, plan_duration: str)
         canv.setFont("Helvetica", 9)
         canv.setFillColor(TEXT_MUTED)
         canv.drawCentredString(width / 2, 3.2 * cm,
-            "Sviluppato con biologi nutrizionisti iscritti all'Ordine")
+            "Calcoli basati sull'equazione Mifflin-St Jeor — validata in letteratura scientifica")
         canv.drawCentredString(width / 2, 2.7 * cm,
             "Conforme alle linee guida LARN — Società Italiana di Nutrizione Umana")
 
