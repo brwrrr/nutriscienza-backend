@@ -37,7 +37,7 @@ from .email_sender import send_admin_failure, send_cancellation_email, send_plan
 from .models import IntakeRequest
 from .nutrition import compute_targets
 from .pdf_builder import build_pdf
-from .plan_generator import generate_meal_plan
+from .plan_generator import generate_meal_plan, generate_workout_plan
 from .stripe_handlers import create_checkout_session, verify_webhook
 
 
@@ -330,14 +330,20 @@ def _run_generation_pipeline(order_id: str) -> None:
 
         storage.update_status(order_id, "generating")
 
-        # 1. Genera il piano via Claude
-        log.info("[%s] richiesta piano a Claude", order_id)
+        # 1. Genera il piano alimentare via Claude (1 / 4 / 12 settimane in base al tier)
+        log.info("[%s] richiesta piano alimentare a Claude (tier=%s)", order_id, order.intake.plan)
         meal_plan = generate_meal_plan(order.intake, order.targets)
+
+        # 1b. Per Completo e Coach genera anche il programma di allenamento
+        workout_plan = None
+        if order.intake.plan in ("completo", "coach"):
+            log.info("[%s] richiesta programma di allenamento a Claude", order_id)
+            workout_plan = generate_workout_plan(order.intake, order.targets)
 
         # 2. Costruisci il PDF
         pdf_path = f"./data/pdfs/{order_id}.pdf"
         log.info("[%s] costruisco PDF -> %s", order_id, pdf_path)
-        build_pdf(order.intake, order.targets, meal_plan, pdf_path)
+        build_pdf(order.intake, order.targets, meal_plan, pdf_path, workout=workout_plan)
 
         # 3. Invia email con allegato
         log.info("[%s] invio email a %s", order_id, order.email)

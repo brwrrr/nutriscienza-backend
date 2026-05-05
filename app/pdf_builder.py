@@ -15,11 +15,11 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import cm
 from reportlab.platypus import (
-    BaseDocTemplate, Frame, NextPageTemplate, PageBreak, PageTemplate,
+    BaseDocTemplate, Frame, KeepTogether, NextPageTemplate, PageBreak, PageTemplate,
     Paragraph, Spacer, Table, TableStyle,
 )
 
-from .models import IntakeRequest, MealPlan, NutritionTargets
+from .models import IntakeRequest, MealPlan, NutritionTargets, WorkoutPlan
 
 
 # ---------- Brand palette ----------
@@ -274,8 +274,12 @@ class _Doc(BaseDocTemplate):
 # ---------- API pubblica ----------
 
 def build_pdf(intake: IntakeRequest, targets: NutritionTargets, plan: MealPlan,
-              output_path: str) -> str:
-    """Genera il PDF e lo salva su `output_path`. Ritorna il path."""
+              output_path: str, workout: WorkoutPlan | None = None) -> str:
+    """Genera il PDF e lo salva su `output_path`. Ritorna il path.
+
+    `workout` è opzionale: se fornito (Completo/Coach), viene aggiunta la sezione
+    «Programma di allenamento» dopo i menù e prima dei consigli del nutrizionista.
+    """
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     story = []
     story.append(NextPageTemplate("Normal"))
@@ -361,56 +365,147 @@ def build_pdf(intake: IntakeRequest, targets: NutritionTargets, plan: MealPlan,
     story.append(macro)
     story.append(PageBreak())
 
-    # ============ Pagine Menù ============
-    story.append(Paragraph("IL TUO MENÙ — 7 GIORNI", EYEBROW))
-    story.append(Paragraph("Cosa mangerai questa settimana.", H1))
-    story.append(Paragraph(
-        "Pasti pensati sull'alimentazione mediterranea, ingredienti facilmente reperibili. "
-        "Le grammature sono indicative del peso a crudo salvo diversa indicazione.", LEAD))
+    # ============ Pagine Menù — una sezione per settimana ============
+    total_weeks = len(plan.weeks)
+    is_multiweek = total_weeks > 1
 
-    for i, day in enumerate(plan.days):
-        story.append(_meal_table(day.label, day.total_kcal, day.meals))
-        story.append(Spacer(1, 12))
-        if i % 2 == 1 and i < len(plan.days) - 1:
-            story.append(PageBreak())
+    # Eyebrow + intro globale (solo prima settimana, poi le settimane si distinguono da sé)
+    if is_multiweek:
+        story.append(Paragraph(f"IL TUO MENÙ — {total_weeks} SETTIMANE", EYEBROW))
+        story.append(Paragraph("Cosa mangerai durante il programma.", H1))
+        story.append(Paragraph(
+            "Ogni settimana ha menù diversi mantenendo gli stessi target nutrizionali. "
+            "Le grammature sono indicative del peso a crudo salvo diversa indicazione.", LEAD))
+    else:
+        story.append(Paragraph("IL TUO MENÙ — 7 GIORNI", EYEBROW))
+        story.append(Paragraph("Cosa mangerai questa settimana.", H1))
+        story.append(Paragraph(
+            "Pasti pensati sull'alimentazione mediterranea, ingredienti facilmente reperibili. "
+            "Le grammature sono indicative del peso a crudo salvo diversa indicazione.", LEAD))
 
-    if plan.weekly_summary:
+    for week_idx, week in enumerate(plan.weeks):
+        # Per piani multi-settimana, intestazione di settimana
+        if is_multiweek:
+            if week_idx > 0:
+                story.append(PageBreak())
+            story.append(Spacer(1, 6))
+            story.append(Paragraph(week.label.upper(), EYEBROW))
+            story.append(Paragraph(week.label, H2))
+            if week.phase:
+                story.append(Paragraph(f"Fase: <b>{week.phase}</b>", BODY))
+                story.append(Spacer(1, 8))
+
+        # Giorni — KeepTogether garantisce che un giorno non si spezzi tra pagine
+        # ed evita la pagina vuota che si otteneva con PageBreak espliciti
+        for day in week.days:
+            story.append(KeepTogether([
+                _meal_table(day.label, day.total_kcal, day.meals),
+                Spacer(1, 12),
+            ]))
+
+        if week.weekly_summary:
+            story.append(Spacer(1, 6))
+            story.append(_info_box("Riepilogo settimanale", week.weekly_summary))
+
+        # Lista della spesa di questa settimana
+        story.append(Spacer(1, 14))
+        shopping_title = "LISTA DELLA SPESA" if not is_multiweek else f"LISTA DELLA SPESA — {week.label}"
+        story.append(Paragraph(shopping_title, EYEBROW))
+        story.append(Paragraph(
+            "Una settimana, una sola spesa." if not is_multiweek else f"Spesa per la {week.label.lower()}.",
+            H3))
+        story.append(Paragraph(
+            "Quantità calcolate per i 7 giorni. Suggeriamo una spesa unica a inizio settimana "
+            "e una piccola integrazione di freschi a metà settimana.", BODY))
         story.append(Spacer(1, 6))
-        story.append(_info_box("Riepilogo settimanale", plan.weekly_summary))
+
+        for cat in week.shopping_list:
+            story.append(Paragraph(cat.name, H3))
+            rows = []
+            row = []
+            for it in cat.items:
+                row.append(Paragraph(f"• {it}", BODY))
+                if len(row) == 3:
+                    rows.append(row); row = []
+            while row and len(row) < 3:
+                row.append(Paragraph("", BODY))
+            if row:
+                rows.append(row)
+            t = Table(rows, colWidths=[5.7 * cm] * 3)
+            t.setStyle(TableStyle([
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+                ("TOPPADDING", (0, 0), (-1, -1), 1),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 1),
+            ]))
+            story.append(t)
+            story.append(Spacer(1, 8))
 
     story.append(PageBreak())
 
-    # ============ Lista della spesa ============
-    story.append(Paragraph("LISTA DELLA SPESA", EYEBROW))
-    story.append(Paragraph("Una settimana, una sola spesa.", H1))
-    story.append(Paragraph(
-        "Quantità calcolate per i 7 giorni di piano. Suggeriamo una spesa unica all'inizio "
-        "della settimana e una piccola integrazione di freschi a metà settimana.", LEAD))
+    # ============ Programma di allenamento (Completo + Coach) ============
+    if workout is not None:
+        story.append(Paragraph("PROGRAMMA DI ALLENAMENTO", EYEBROW))
+        story.append(Paragraph("Il tuo piano di lavoro in palestra.", H1))
+        story.append(Paragraph(workout.methodology, BODY_JUST))
+        story.append(Spacer(1, 10))
+        story.append(_info_box("Come progredire nel tempo", workout.progression_notes,
+                                accent=GOLD_DARK, bg=CREAM))
+        story.append(Spacer(1, 14))
 
-    for cat in plan.shopping_list:
-        story.append(Paragraph(cat.name, H3))
-        rows = []
-        row = []
-        for it in cat.items:
-            row.append(Paragraph(f"• {it}", BODY))
-            if len(row) == 3:
-                rows.append(row); row = []
-        while row and len(row) < 3:
-            row.append(Paragraph("", BODY))
-        if row:
-            rows.append(row)
-        t = Table(rows, colWidths=[5.7 * cm] * 3)
-        t.setStyle(TableStyle([
-            ("VALIGN", (0, 0), (-1, -1), "TOP"),
-            ("LEFTPADDING", (0, 0), (-1, -1), 0),
-            ("RIGHTPADDING", (0, 0), (-1, -1), 6),
-            ("TOPPADDING", (0, 0), (-1, -1), 1),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 1),
-        ]))
-        story.append(t)
-        story.append(Spacer(1, 8))
+        for w_idx, w_week in enumerate(workout.weeks):
+            if w_idx > 0:
+                story.append(PageBreak())
+            header_label = f"Settimana {w_week.week_number} — {w_week.phase}"
+            story.append(Paragraph(header_label.upper(), EYEBROW))
+            story.append(Paragraph(header_label, H2))
+            if w_week.week_focus:
+                story.append(Paragraph(f"<i>{w_week.week_focus}</i>", BODY))
+            story.append(Spacer(1, 10))
 
-    story.append(PageBreak())
+            for sess in w_week.sessions:
+                # Costruisci una tabella esercizi per la sessione
+                ex_rows = [[
+                    Paragraph("<b>Esercizio</b>", BODY),
+                    Paragraph("<b>Serie x Reps</b>", BODY),
+                    Paragraph("<b>Recupero</b>", BODY),
+                    Paragraph("<b>Note</b>", BODY),
+                ]]
+                for ex in sess.exercises:
+                    ex_rows.append([
+                        Paragraph(ex.name, BODY),
+                        Paragraph(ex.sets_reps, BODY),
+                        Paragraph(ex.rest, BODY),
+                        Paragraph(ex.notes or "—", SMALL),
+                    ])
+
+                ex_table = Table(ex_rows, colWidths=[6 * cm, 3 * cm, 2.2 * cm, 5.3 * cm])
+                ex_table.setStyle(TableStyle([
+                    ("BACKGROUND", (0, 0), (-1, 0), GREEN_DEEP),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), white),
+                    ("BACKGROUND", (0, 1), (-1, -1), white),
+                    ("GRID", (0, 0), (-1, -1), 0.4, BORDER),
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 8),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+                    ("TOPPADDING", (0, 0), (-1, -1), 6),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                ]))
+
+                # Header sessione + tabella tenuti insieme
+                session_block = [
+                    Paragraph(sess.label, H3),
+                    Paragraph(
+                        f"Durata stimata: <b>{sess.duration_min} min</b> · Focus: {sess.focus}",
+                        SMALL),
+                    Spacer(1, 6),
+                    ex_table,
+                    Spacer(1, 14),
+                ]
+                story.append(KeepTogether(session_block))
+
+        story.append(PageBreak())
 
     # ============ Note + disclaimer ============
     story.append(Paragraph("NOTE DEL NUTRIZIONISTA", EYEBROW))

@@ -36,7 +36,7 @@ from .email_sender import send_admin_failure, send_refresh_plan_email
 from .models import IntakeRequest, NutritionTargets
 from .nutrition import compute_targets
 from .pdf_builder import build_pdf
-from .plan_generator import generate_meal_plan
+from .plan_generator import generate_meal_plan, generate_workout_plan
 from . import storage
 
 logging.basicConfig(
@@ -117,6 +117,12 @@ def _refresh_one(row: sqlite3.Row, plan_month: int) -> None:
     log.info("[%s] richiesta piano a Claude", sub_id)
     meal_plan = generate_meal_plan(intake, targets)
 
+    # 3b. Per Completo / Coach genera anche il programma di allenamento aggiornato
+    workout_plan = None
+    if intake.plan in ("completo", "coach"):
+        log.info("[%s] richiesta programma di allenamento a Claude", sub_id)
+        workout_plan = generate_workout_plan(intake, targets)
+
     # 4. Costruisci il PDF in una directory temporanea
     #    (non inquina ./data/pdfs con file di refresh infiniti)
     pdf_dir = Path("./data/pdfs/refreshes")
@@ -124,7 +130,7 @@ def _refresh_one(row: sqlite3.Row, plan_month: int) -> None:
     pdf_path = str(pdf_dir / f"{sub_id}_mese{plan_month}.pdf")
 
     log.info("[%s] costruisco PDF -> %s", sub_id, pdf_path)
-    build_pdf(intake, targets, meal_plan, pdf_path)
+    build_pdf(intake, targets, meal_plan, pdf_path, workout=workout_plan)
 
     # 5. Invia l'email di refresh con link check-in per il mese successivo
     checkin_token = row["checkin_token"] or ""
