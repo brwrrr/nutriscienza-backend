@@ -330,3 +330,59 @@ def count_orders_by_status() -> dict[str, int]:
             "SELECT status, COUNT(*) as n FROM orders GROUP BY status"
         ).fetchall()
     return {r["status"]: r["n"] for r in rows}
+
+
+# ---------- Dashboard queries ----------
+
+def get_paid_orders_since(since_iso: str) -> list[sqlite3.Row]:
+    """
+    Orders that reached at least 'paid' status since `since_iso`.
+    Used per period (today / week / month) to compute revenue + costs.
+    Status 'paid', 'generating', and 'sent' all imply the customer has been charged.
+    """
+    with _conn() as c:
+        return c.execute(
+            """SELECT id, plan_chosen, email, status, created_at, updated_at
+               FROM orders
+               WHERE status IN ('paid', 'generating', 'sent')
+                 AND updated_at >= ?
+               ORDER BY updated_at DESC""",
+            (since_iso,),
+        ).fetchall()
+
+
+def count_subscribers_by_plan_active() -> dict[str, int]:
+    """Subscriber count per plan, only those currently active or past_due (still billable)."""
+    with _conn() as c:
+        rows = c.execute(
+            """SELECT plan, COUNT(*) as n
+               FROM subscribers
+               WHERE subscription_status IN ('active', 'past_due')
+               GROUP BY plan"""
+        ).fetchall()
+    return {r["plan"]: r["n"] for r in rows}
+
+
+def count_orders_by_plan_paid() -> dict[str, int]:
+    """One-time + recurring counts of paid orders by plan (lifetime)."""
+    with _conn() as c:
+        rows = c.execute(
+            """SELECT plan_chosen, COUNT(*) as n
+               FROM orders
+               WHERE status IN ('paid', 'generating', 'sent')
+               GROUP BY plan_chosen"""
+        ).fetchall()
+    return {r["plan_chosen"]: r["n"] for r in rows}
+
+
+def get_latest_paid_orders(limit: int = 10) -> list[sqlite3.Row]:
+    """Most recent transactions (paid+) for the dashboard transaction list."""
+    with _conn() as c:
+        return c.execute(
+            """SELECT id, plan_chosen, email, status, updated_at
+               FROM orders
+               WHERE status IN ('paid', 'generating', 'sent')
+               ORDER BY updated_at DESC
+               LIMIT ?""",
+            (limit,),
+        ).fetchall()

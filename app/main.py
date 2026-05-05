@@ -17,6 +17,7 @@ Endpoint admin (Bearer ADMIN_API_KEY):
 """
 import logging
 import traceback
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -283,6 +284,102 @@ def checkin_post(token: str, body: CheckinPayload):
 def admin_stats():
     return {
         "orders_by_status": storage.count_orders_by_status(),
+    }
+
+
+# ---------- Dashboard ----------
+
+# Listino prezzi (in centesimi) — fonte di verità per il calcolo ricavi nella dashboard.
+# Allineato a quanto pubblicato sul landing index.html.
+PLAN_PRICE_CENTS: dict[str, int] = {
+    "base": 1900,       # €19 una tantum
+    "completo": 2900,   # €29/mese
+    "coach": 9900,      # €99/mese
+}
+
+# Stima costi variabili per ordine (in centesimi):
+# - API Anthropic per generazione (tier-dependent)
+# - Stripe fees: ~1.5% + €0.25 per transazione
+# Queste cifre sono stime; per accounting reale incrocia con dashboard Stripe.
+PLAN_API_COST_CENTS: dict[str, int] = {
+    "base": 10,         # 1 chiamata pasti
+    "completo": 50,     # 4 chiamate pasti + 1 workout
+    "coach": 140,       # 12 chiamate pasti + 1 workout
+}
+
+STRIPE_FEE_PCT = 0.015
+STRIPE_FEE_FIXED_CENTS = 25
+
+
+def _stripe_fee_cents(amount_cents: int) -> int:
+    return int(amount_cents * STRIPE_FEE_PCT) + STRIPE_FEE_FIXED_CENTS
+
+
+def _aggregate_period(rows) -> dict:
+    """Aggrega ricavi e costi su una lista di ordini paid+."""
+    revenue = 0
+    api_cost = 0
+    stripe_fee = 0
+    by_plan: dict[str, int] = {}
+    for r in rows:
+        plan = r["plan_chosen"]
+        price = PLAN_PRICE_CENTS.get(plan, 0)
+        revenue += price
+        api_cost += PLAN_API_COST_CENTS.get(plan, 0)
+        stripe_fee += _stripe_fee_cents(price)
+        by_plan[plan] = by_plan.get(plan, 0) + 1
+    total_cost = api_cost + stripe_fee
+    return {
+        "count": len(rows),
+        "revenue_cents": revenue,
+        "api_cost_cents": api_cost,
+        "stripe_fee_cents": stripe_fee,
+        "total_cost_cents": total_cost,
+        "profit_cents": revenue - total_cost,
+        "by_plan": by_plan,
+    }
+
+
+@app.get("/api/admin/dashboard", dependencies=[Depends(require_admin)])
+def admin_dashboard():
+    """
+    Snapshot operativo: ricavi/costi per oggi/settimana/mese, distribuzione tier,
+    transazioni recenti. Fonte di verità per accounting interno.
+    """
+    now = datetime.now(timezone.utc)
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    # Lunedì = inizio settimana ISO
+    week_start = (today_start - timedelta(days=now.weekday()))
+    month_start = today_start.replace(day=1)
+
+    rows_today = storage.get_paid_orders_since(today_start.isoformat())
+    rows_week = storage.get_paid_orders_since(week_start.isoformat())
+    rows_month = storage.get_paid_orders_since(month_start.isoformat())
+
+    plan_distribution = storage.count_orders_by_plan_paid()
+    active_subscribers = storage.count_subscribers_by_plan_active()
+    latest = storage.get_latest_paid_orders(limit=10)
+
+    latest_transactions = []
+    for r in latest:
+        plan = r["plan_chosen"]
+        latest_transactions.append({
+            "id": r["id"],
+            "plan": plan,
+            "email": r["email"],
+            "amount_cents": PLAN_PRICE_CENTS.get(plan, 0),
+            "status": r["status"],
+            "date": r["updated_at"],
+        })
+
+    return {
+        "today": _aggregate_period(rows_today),
+        "week": _aggregate_period(rows_week),
+        "month": _aggregate_period(rows_month),
+        "plan_distribution_lifetime": plan_distribution,
+        "active_subscribers_by_plan": active_subscribers,
+        "latest_transactions": latest_transactions,
+        "pricing_cents": PLAN_PRICE_CENTS,
     }
 
 

@@ -58,7 +58,7 @@ def _email_html(intake: IntakeRequest) -> str:
       <p style="font-size:14px;color:#6B6B6B;line-height:1.6;">
         Hai domande sul piano? Rispondi a questa email o scrivici a
         <a href="mailto:{settings.support_email}" style="color:#2D5F3F;">{settings.support_email}</a> —
-        ti risponde un nutrizionista entro 48 ore.
+        ti rispondiamo entro 48 ore.
       </p>
       <hr style="border:none;border-top:1px solid #E5E0D3;margin:28px 0 18px;">
       <p style="font-size:12px;color:#6B6B6B;line-height:1.5;">
@@ -145,7 +145,7 @@ def _refresh_email_html(first_name: str, plan: str, plan_month: int, checkin_url
       <p style="font-size:14px;color:#6B6B6B;line-height:1.6;">
         Hai domande sul piano? Scrivi a
         <a href="mailto:{settings.support_email}" style="color:#2D5F3F;">{settings.support_email}</a> —
-        ti risponde un nutrizionista entro 48 ore.
+        ti rispondiamo entro 48 ore.
       </p>
       <hr style="border:none;border-top:1px solid #E5E0D3;margin:28px 0 18px;">
       <p style="font-size:12px;color:#6B6B6B;line-height:1.5;">
