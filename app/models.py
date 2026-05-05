@@ -94,11 +94,50 @@ class ShoppingCategory(BaseModel):
     items: list[str]
 
 
-class MealPlan(BaseModel):
+class WeekPlan(BaseModel):
+    """Una singola settimana del piano (7 giorni + lista spesa di settimana)."""
+    week_number: int                          # 1, 2, 3, ...
+    label: str                                # "Settimana 1" o "Settimana 1 — Adattamento"
+    phase: Optional[str] = None               # solo per coach: "Adattamento", "Ipertrofia", "Picco"
     days: list[Day]
     shopping_list: list[ShoppingCategory]
-    weekly_summary: str       # paragrafo di sintesi
-    nutritionist_tips: list[dict]  # [{"title": "...", "text": "..."}]
+    weekly_summary: str
+
+
+class MealPlan(BaseModel):
+    """Container del piano alimentare. 1 settimana per Base, 4 per Completo, 12 per Coach."""
+    weeks: list[WeekPlan]
+    nutritionist_tips: list[dict]             # [{"title": "...", "text": "..."}] — globali
+
+
+# ---------- Programma di allenamento (completo + coach) ----------
+
+class Exercise(BaseModel):
+    name: str                                 # "Squat con bilanciere"
+    sets_reps: str                            # "4 x 6-8" o "3 x 12"
+    rest: str                                 # "120s" / "90s"
+    notes: Optional[str] = None               # tecnica, RPE, sostituzioni
+
+
+class WorkoutSession(BaseModel):
+    label: str                                # "Sessione A — Forza Upper"
+    duration_min: int                         # durata stimata
+    focus: str                                # "Pettorali, spalle, tricipiti"
+    exercises: list[Exercise]
+
+
+class WorkoutWeek(BaseModel):
+    week_number: int
+    phase: str                                # "Adattamento", "Ipertrofia", "Forza", "Picco"
+    week_focus: str                           # frase breve sull'obiettivo della settimana
+    sessions: list[WorkoutSession]
+
+
+class WorkoutPlan(BaseModel):
+    """Programma di allenamento. 4 settimane per Completo, 12 per Coach."""
+    weeks: list[WorkoutWeek]
+    methodology: str                          # paragrafo introduttivo sul metodo
+    progression_notes: str                    # come gestire la progressione dei carichi
 
 
 # ---------- Order record ----------
