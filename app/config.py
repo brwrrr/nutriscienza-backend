@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     # App
     base_url: str = "https://nutriscienza.org"
     database_path: str = "./data/orders.db"
+    pdf_storage_dir: str = "./data/pdfs"   # In prod su Render: /var/data/pdfs (disco persistente)
     environment: str = "development"
 
     # Admin

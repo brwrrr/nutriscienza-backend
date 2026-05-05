@@ -411,6 +411,32 @@ def admin_retry(order_id: str, background_tasks: BackgroundTasks):
     return {"queued": True, "order_id": order_id}
 
 
+@app.get("/api/admin/orders/{order_id}/pdf", dependencies=[Depends(require_admin)])
+def admin_download_pdf(order_id: str):
+    """Scarica il PDF generato per un ordine. Richiede stato 'sent' e file presente sul disco."""
+    from fastapi.responses import FileResponse
+
+    order = storage.get_order(order_id)
+    if not order:
+        raise HTTPException(status_code=404, detail="Ordine non trovato")
+    if not order.pdf_path:
+        raise HTTPException(status_code=404, detail="Nessun PDF associato a questo ordine")
+    pdf_file = Path(order.pdf_path)
+    if not pdf_file.exists():
+        raise HTTPException(
+            status_code=410,
+            detail="File PDF mancante sul disco (probabilmente generato prima del disco persistente). Usa Retry per rigenerarlo."
+        )
+    # Filename leggibile per il download
+    safe_name = "".join(c for c in order.intake.first_name if c.isalnum() or c in " -_").strip() or "cliente"
+    download_name = f"NutriScienza-{order.plan_chosen}-{safe_name}-{order_id[:8]}.pdf"
+    return FileResponse(
+        path=str(pdf_file),
+        media_type="application/pdf",
+        filename=download_name,
+    )
+
+
 # ---------- Pipeline di generazione ----------
 
 def _run_generation_pipeline(order_id: str) -> None:
@@ -437,8 +463,8 @@ def _run_generation_pipeline(order_id: str) -> None:
             log.info("[%s] richiesta programma di allenamento a Claude", order_id)
             workout_plan = generate_workout_plan(order.intake, order.targets)
 
-        # 2. Costruisci il PDF
-        pdf_path = f"./data/pdfs/{order_id}.pdf"
+        # 2. Costruisci il PDF (su disco persistente in prod)
+        pdf_path = f"{settings.pdf_storage_dir.rstrip('/')}/{order_id}.pdf"
         log.info("[%s] costruisco PDF -> %s", order_id, pdf_path)
         build_pdf(order.intake, order.targets, meal_plan, pdf_path, workout=workout_plan)
 

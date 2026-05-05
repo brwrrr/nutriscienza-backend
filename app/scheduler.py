@@ -123,9 +123,9 @@ def _refresh_one(row: sqlite3.Row, plan_month: int) -> None:
         log.info("[%s] richiesta programma di allenamento a Claude", sub_id)
         workout_plan = generate_workout_plan(intake, targets)
 
-    # 4. Costruisci il PDF in una directory temporanea
-    #    (non inquina ./data/pdfs con file di refresh infiniti)
-    pdf_dir = Path("./data/pdfs/refreshes")
+    # 4. Costruisci il PDF nel disco persistente (sottodir refreshes per non
+    #    confondere con i PDF dell'ordine iniziale)
+    pdf_dir = Path(settings.pdf_storage_dir) / "refreshes"
     pdf_dir.mkdir(parents=True, exist_ok=True)
     pdf_path = str(pdf_dir / f"{sub_id}_mese{plan_month}.pdf")
 
