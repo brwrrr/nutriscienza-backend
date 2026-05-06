@@ -20,8 +20,17 @@ PLAN_DESCRIPTIONS = {
 }
 
 
-def _email_html(intake: IntakeRequest) -> str:
+def _email_html(intake: IntakeRequest, manage_url: str = "") -> str:
     plan_desc = PLAN_DESCRIPTIONS[intake.plan]
+    # Per i piani in abbonamento (completo/coach) mostriamo il link di gestione
+    # già dal day-1, in linea con i T&C e con il Codice del Consumo (art. 49+).
+    manage_block = ""
+    if manage_url and intake.plan in ("completo", "coach"):
+        manage_block = f"""
+      <p style="font-size:13px;color:#6B6B6B;line-height:1.6;text-align:center;margin:18px 0 0;">
+        Vuoi annullare o aggiornare la carta in qualsiasi momento?
+        <a href="{manage_url}" style="color:#2D5F3F;font-weight:600;">Gestisci il tuo abbonamento →</a>
+      </p>"""
     return f"""\
 <!DOCTYPE html>
 <html lang="it">
@@ -59,7 +68,7 @@ def _email_html(intake: IntakeRequest) -> str:
         Hai domande sul piano? Rispondi a questa email o scrivici a
         <a href="mailto:{settings.support_email}" style="color:#2D5F3F;">{settings.support_email}</a> —
         ti rispondiamo entro 48 ore.
-      </p>
+      </p>{manage_block}
       <hr style="border:none;border-top:1px solid #E5E0D3;margin:28px 0 18px;">
       <p style="font-size:12px;color:#6B6B6B;line-height:1.5;">
         Questo piano ha finalità educative e non sostituisce il parere di un medico in presenza di
@@ -74,7 +83,7 @@ def _email_html(intake: IntakeRequest) -> str:
 </html>"""
 
 
-def send_plan_email(intake: IntakeRequest, pdf_path: str) -> str:
+def send_plan_email(intake: IntakeRequest, pdf_path: str, manage_url: str = "") -> str:
     """
     Invia email con PDF in allegato. Ritorna l'id Resend.
     Solleva eccezione se l'invio fallisce.
@@ -88,7 +97,7 @@ def send_plan_email(intake: IntakeRequest, pdf_path: str) -> str:
         "from": settings.from_email,
         "to": [intake.email],
         "subject": f"Il tuo {plan_desc} è pronto, {intake.first_name} 🌿",
-        "html": _email_html(intake),
+        "html": _email_html(intake, manage_url=manage_url),
         "attachments": [{
             "filename": pdf_filename,
             "content": pdf_b64,
@@ -142,6 +151,10 @@ def _refresh_email_html(first_name: str, plan: str, plan_month: int, checkin_url
           Aggiorna il mio peso →
         </a>
       </div>
+      <p style="font-size:13px;color:#6B6B6B;line-height:1.6;text-align:center;margin-top:8px;">
+        Vuoi annullare o aggiornare la carta?
+        <a href="{checkin_url}" style="color:#2D5F3F;font-weight:600;">Gestisci abbonamento</a>
+      </p>
       <p style="font-size:14px;color:#6B6B6B;line-height:1.6;">
         Hai domande sul piano? Scrivi a
         <a href="mailto:{settings.support_email}" style="color:#2D5F3F;">{settings.support_email}</a> —

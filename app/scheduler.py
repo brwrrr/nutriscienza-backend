@@ -87,6 +87,19 @@ def run() -> dict[str, int]:
             except Exception:
                 log.exception("[%s] impossibile inviare notifica admin", sub_id)
 
+    # ── Affiliate: promuovi le commissioni mature ────────────────────────
+    # Pending → approved per quelle col payable_at scaduto (30gg di hold).
+    # Best-effort: un fallimento qui non deve compromettere il run principale.
+    try:
+        from . import affiliate as _affiliate
+        approved = _affiliate.approve_matured_commissions()
+        if approved:
+            log.info("Commissioni affiliate promosse a 'approved': %d", approved)
+        counts["affiliate_approved"] = approved
+    except Exception:
+        log.exception("Approvazione commissioni mature fallita — ignorata")
+        counts["affiliate_approved"] = 0
+
     log.info(
         "Run completato — %d processati, %d successi, %d falliti, %d saltati",
         counts["due"], counts["success"], counts["failed"], counts["skipped"],

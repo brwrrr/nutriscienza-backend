@@ -328,6 +328,19 @@ def set_subscriber_status(stripe_subscription_id: str, status: str) -> None:
         )
 
 
+def update_subscriber_customer_id(subscriber_id: str, stripe_customer_id: str) -> None:
+    """
+    Backfill helper. Subscriber legacy creati prima del fix possono avere
+    stripe_customer_id NULL — al primo accesso al billing portal lo
+    recuperiamo da Stripe e lo salviamo qui per le chiamate successive.
+    """
+    with _conn() as c:
+        c.execute(
+            "UPDATE subscribers SET stripe_customer_id=? WHERE id=?",
+            (stripe_customer_id, subscriber_id),
+        )
+
+
 # ── Check-in mensile ──────────────────────────────────────────────────────────
 
 def get_subscriber_by_checkin_token(token: str) -> sqlite3.Row | None:
@@ -553,6 +566,19 @@ def update_affiliate_status(affiliate_id: str, status: str) -> None:
         c.execute(
             "UPDATE affiliates SET status=? WHERE id=?",
             (status, affiliate_id),
+        )
+
+
+def update_affiliate_commission_rate(affiliate_id: str, commission_rate: float) -> None:
+    """Admin-only: tweak the % commission for an affiliate.
+    Stored as fraction (0.30 = 30%). Future commissions use the new rate;
+    already-recorded commissions are immutable."""
+    if not 0.0 <= commission_rate <= 1.0:
+        raise ValueError("commission_rate deve essere tra 0 e 1 (es. 0.30 = 30%)")
+    with _conn() as c:
+        c.execute(
+            "UPDATE affiliates SET commission_rate=? WHERE id=?",
+            (commission_rate, affiliate_id),
         )
 
 

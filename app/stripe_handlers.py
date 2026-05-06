@@ -65,3 +65,25 @@ def verify_webhook(payload: bytes, sig_header: str) -> stripe.Event:
     return stripe.Webhook.construct_event(
         payload, sig_header, settings.stripe_webhook_secret
     )
+
+
+def create_portal_session(customer_id: str, return_url: str) -> stripe.billing_portal.Session:
+    """
+    Crea una Stripe Customer Portal Session.
+
+    Permette al subscriber di gestire l'abbonamento in self-service
+    (annullamento, aggiornamento carta, fatture). Riduce ticket al supporto
+    e dispute "couldn't cancel" — entrambe killer di profittabilità.
+
+    Configurazione richiesta una tantum sul Stripe Dashboard:
+      Settings → Billing → Customer portal → Activate
+        - Cancel subscriptions: ON, "at end of billing period" (allinea ai T&C)
+        - Update payment method: ON
+        - View invoices: ON
+        - Cancellation reason: ON (raccoglie segnale per ridurre churn)
+    """
+    return stripe.billing_portal.Session.create(
+        customer=customer_id,
+        return_url=return_url,
+        locale="it",
+    )

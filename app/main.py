@@ -39,7 +39,7 @@ from .models import IntakeRequest
 from .nutrition import compute_targets
 from .pdf_builder import build_pdf
 from .plan_generator import generate_meal_plan, generate_workout_plan
-from .stripe_handlers import create_checkout_session, verify_webhook
+from .stripe_handlers import create_checkout_session, create_portal_session, verify_webhook
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -259,6 +259,20 @@ async def stripe_webhook(
             storage.set_subscriber_status(sub_id, "past_due")
             log.warning("Pagamento fallito per subscription %s", sub_id)
 
+    elif event["type"] == "charge.refunded":
+        # Reversal commissione affiliato. Best-effort: se non troviamo
+        # match continuiamo silenziosamente (potrebbe essere un refund
+        # su un acquisto pre-affiliate-program).
+        try:
+            charge: dict[str, Any] = event["data"]["object"]
+            invoice_id = charge.get("invoice")
+            charge_id = charge.get("id")
+            n = affiliate.reverse_commission_for_charge(invoice_id, charge_id)
+            if n:
+                log.info("Reverse commission: %d riga/he aggiornate (charge=%s)", n, charge_id)
+        except Exception:
+            log.exception("Reverse commission fallita")
+
     elif event["type"] == "customer.subscription.deleted":
         sub: dict[str, Any] = event["data"]["object"]
         sub_id = sub.get("id")
@@ -337,6 +351,57 @@ def checkin_post(token: str, body: CheckinPayload):
     if not ok:
         raise HTTPException(status_code=404, detail="Link non valido o già utilizzato")
     return {"success": True, "message": "Peso aggiornato. Il prossimo piano userà il nuovo valore."}
+
+
+# ---------- Billing Portal (self-service cancellation) ----------
+#
+# Stripe-hosted Customer Portal. Permette al subscriber di:
+#   - annullare l'abbonamento (configurato "end-of-period" → coerente con T&C)
+#   - aggiornare la carta (riduce involuntary churn da carta scaduta)
+#   - scaricare le fatture
+#
+# Auth via checkin_token: stessa identità già usata dal flusso check-in mensile.
+# Funziona solo per subscriber 'active' (post-cancellazione lo status filtra il token).
+
+@app.post("/api/billing-portal/{token}")
+def billing_portal(token: str):
+    row = storage.get_subscriber_by_checkin_token(token)
+    if not row:
+        raise HTTPException(status_code=404, detail="Link non valido o abbonamento già cancellato")
+
+    # Il piano 'base' è one-time — nessuna subscription da gestire.
+    if row["plan"] == "base":
+        raise HTTPException(status_code=400, detail="Il Piano Base è un acquisto unico, non c'è nulla da gestire.")
+
+    customer_id = row["stripe_customer_id"]
+    sub_id = row["stripe_subscription_id"]
+
+    # Backfill per subscriber legacy senza customer_id su DB.
+    if not customer_id and sub_id:
+        try:
+            sub = stripe.Subscription.retrieve(sub_id)
+            customer_id = sub.get("customer")
+            if customer_id:
+                storage.update_subscriber_customer_id(row["id"], customer_id)
+        except Exception:
+            log.exception("Recupero customer_id Stripe fallito sub=%s", sub_id)
+
+    if not customer_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Account Stripe non collegato — scrivi a supporto@nutriscienza.org",
+        )
+
+    try:
+        session = create_portal_session(
+            customer_id=customer_id,
+            return_url=f"{settings.base_url}/checkin.html?token={token}",
+        )
+    except stripe.error.StripeError:
+        log.exception("Portal session creation failed cust=%s", customer_id)
+        raise HTTPException(status_code=502, detail="Errore Stripe — riprova tra poco.")
+
+    return {"url": session.url}
 
 
 # ---------- Admin ----------
@@ -517,6 +582,10 @@ class AffiliatePayout(BaseModel):
     currency: str = "eur"
 
 
+class AffiliateRateUpdate(BaseModel):
+    commission_rate: float
+
+
 @app.post("/api/admin/affiliates", dependencies=[Depends(require_admin)])
 def admin_create_affiliate(payload: AffiliateCreate):
     try:
@@ -554,6 +623,19 @@ def admin_update_affiliate_status(aff_id: str, status: str):
         raise HTTPException(status_code=422, detail="Status non valido")
     storage.update_affiliate_status(aff_id, status)
     return {"ok": True}
+
+
+@app.post("/api/admin/affiliates/{aff_id}/commission-rate", dependencies=[Depends(require_admin)])
+def admin_update_affiliate_commission_rate(aff_id: str, body: AffiliateRateUpdate):
+    """Adjust the affiliate's commission rate. Stored as fraction (0.30 = 30%)."""
+    aff = storage.get_affiliate_by_id(aff_id)
+    if not aff:
+        raise HTTPException(status_code=404, detail="Affiliate non trovato")
+    try:
+        storage.update_affiliate_commission_rate(aff_id, body.commission_rate)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    return {"ok": True, "commission_rate": body.commission_rate}
 
 
 @app.post("/api/admin/affiliates/approve-matured", dependencies=[Depends(require_admin)])
@@ -673,21 +755,12 @@ def _run_generation_pipeline(order_id: str) -> None:
         log.info("[%s] costruisco PDF -> %s", order_id, pdf_path)
         build_pdf(order.intake, order.targets, meal_plan, pdf_path, workout=workout_plan)
 
-        # 3. Invia email con allegato
-        log.info("[%s] invio email a %s", order_id, order.email)
-        email_id = send_plan_email(order.intake, pdf_path)
-        log.info("[%s] email inviata (resend_id=%s)", order_id, email_id)
-
-        storage.update_status(order_id, "sent", pdf_path=pdf_path)
-        log.info("[%s] pipeline completata", order_id)
-
-        # Per i piani ricorrenti (completo / coach) creiamo il record subscriber
-        # così il cron sa quando rigenerare il piano il mese prossimo.
+        # 3. Per i piani ricorrenti creiamo PRIMA il subscriber, così possiamo
+        #    iniettare il link "Gestisci abbonamento" già nella welcome email
+        #    (compliance Codice del Consumo art. 49 + allineamento T&C).
+        manage_url = ""
         if order.plan_chosen in ("completo", "coach"):
-            # Recupera i Stripe ID salvati sull'ordine dal webhook
             fresh = storage.get_order(order_id)
-            # Recupera affiliate_ref dall'order così viene salvato sul subscriber:
-            # le invoice di rinnovo lo useranno per attribuire commissioni ricorrenti.
             aff_ref = None
             try:
                 aff_ref = storage.get_order_affiliate_ref(order_id)
@@ -702,6 +775,19 @@ def _run_generation_pipeline(order_id: str) -> None:
                 affiliate_ref=aff_ref,
             )
             log.info("[%s] subscriber creato: %s (prossimo piano in ~30 giorni)", order_id, sub_id)
+            sub_row = storage.get_subscriber_by_stripe_sub(
+                getattr(fresh, "stripe_subscription_id", None) if fresh else None
+            )
+            if sub_row and sub_row["checkin_token"]:
+                manage_url = f"{settings.base_url}/checkin.html?token={sub_row['checkin_token']}"
+
+        # 4. Invia email con allegato (manage_url vuoto per Piano Base)
+        log.info("[%s] invio email a %s", order_id, order.email)
+        email_id = send_plan_email(order.intake, pdf_path, manage_url=manage_url)
+        log.info("[%s] email inviata (resend_id=%s)", order_id, email_id)
+
+        storage.update_status(order_id, "sent", pdf_path=pdf_path)
+        log.info("[%s] pipeline completata", order_id)
 
     except Exception as e:
         err = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
