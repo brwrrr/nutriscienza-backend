@@ -32,7 +32,7 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
-from . import storage
+from . import affiliate, storage
 from .config import settings
 from .email_sender import send_admin_failure, send_cancellation_email, send_plan_email
 from .models import IntakeRequest
@@ -112,10 +112,22 @@ def intake(request: Request, payload: IntakeRequest):
     e una Checkout Session Stripe. Ritorna l'URL del checkout.
     """
     targets = compute_targets(payload)
-    order_id = storage.create_order(payload, targets)
+
+    # Validazione ref affiliate. Se invalido o disattivato, lo droppiamo
+    # silenziosamente — un ref non valido NON deve impedire l'acquisto.
+    validated_ref: str | None = None
+    try:
+        validated_ref = affiliate.validate_ref_for_checkout(payload.affiliate_ref)
+    except Exception:
+        log.exception("Errore validazione affiliate_ref — ignorato")
+
+    order_id = storage.create_order(payload, targets, affiliate_ref=validated_ref)
 
     try:
-        session = create_checkout_session(order_id, payload.plan, payload.email)
+        session = create_checkout_session(
+            order_id, payload.plan, payload.email,
+            affiliate_ref=validated_ref,
+        )
     except stripe.error.StripeError as e:
         log.exception("Stripe checkout fallito per ordine %s", order_id)
         storage.update_status(order_id, "failed", error=f"stripe: {e}")
@@ -182,6 +194,26 @@ async def stripe_webhook(
         storage.update_status(order_id, "paid")
         background_tasks.add_task(_run_generation_pipeline, order_id)
 
+        # ── Commissione affiliato (one-shot Base) ─────────────────────────
+        # Per Base mode=payment NON c'è invoice → bookiamo qui.
+        # Per subscription bookiamo su invoice.payment_succeeded (più sotto)
+        # così l'idempotenza è ancorata all'invoice_id.
+        try:
+            session_meta = session.get("metadata") or {}
+            ref = session_meta.get("affiliate_ref")
+            plan = session_meta.get("plan")
+            if ref and plan == "base":
+                affiliate.record_commission_oneshot(
+                    order_id=order_id,
+                    affiliate_ref=ref,
+                    plan=plan,
+                    stripe_session_id=session.get("id"),
+                    stripe_customer_id=session.get("customer"),
+                    customer_email=(session.get("customer_details") or {}).get("email") or "",
+                )
+        except Exception:
+            log.exception("[%s] commission one-shot fallita — ignorata", order_id)
+
     elif event["type"] in ("checkout.session.expired", "checkout.session.async_payment_failed"):
         session = event["data"]["object"]
         order_id = (session.get("metadata") or {}).get("order_id")
@@ -202,6 +234,23 @@ async def stripe_webhook(
             if invoice.get("billing_reason") != "subscription_create":
                 storage.set_subscriber_status(sub_id, "active")
                 log.info("Rinnovo confermato per subscription %s — cron genererà il piano", sub_id)
+
+        # ── Commissione affiliato (subscription) ──────────────────────────
+        # Bookiamo per OGNI invoice paid (incluso il primo pagamento).
+        # Idempotenza garantita dalla UNIQUE su stripe_event_ref=inv:<id>.
+        try:
+            invoice_id = invoice.get("id")
+            amount_paid = int(invoice.get("amount_paid") or 0)
+            if sub_id and invoice_id and amount_paid > 0:
+                affiliate.record_commission_subscription(
+                    stripe_invoice_id=invoice_id,
+                    stripe_subscription_id=sub_id,
+                    stripe_customer_id=invoice.get("customer"),
+                    amount_paid_cents=amount_paid,
+                    currency=(invoice.get("currency") or "eur").lower(),
+                )
+        except Exception:
+            log.exception("commission subscription fallita inv=%s — ignorata", invoice.get("id"))
 
     elif event["type"] == "invoice.payment_failed":
         invoice = event["data"]["object"]
@@ -224,6 +273,18 @@ async def stripe_webhook(
                     first_name=sub_row["first_name"],
                     plan=sub_row["plan"],
                 )
+
+    elif event["type"] == "charge.refunded":
+        # Reversal commissioni affiliate — best effort, mai blocca.
+        try:
+            charge: dict[str, Any] = event["data"]["object"]
+            invoice_id = charge.get("invoice")
+            charge_id = charge.get("id")
+            n = affiliate.reverse_commission_for_charge(invoice_id, charge_id)
+            if n:
+                log.info("Reversed %d commission(s) per charge=%s", n, charge_id)
+        except Exception:
+            log.exception("Reversal commissioni fallito — ignorato")
 
     return {"received": True}
 
@@ -437,6 +498,150 @@ def admin_download_pdf(order_id: str):
     )
 
 
+# ---------- Affiliate program ----------
+# Tutto isolato: i fallimenti qui non toccano checkout, generazione, email.
+
+class AffiliateCreate(BaseModel):
+    name: str
+    email: str
+    commission_rate: float = 0.30
+    payout_method: str = "manual"
+    custom_code: str | None = None
+
+
+class AffiliatePayout(BaseModel):
+    affiliate_id: str
+    method: str
+    external_ref: str | None = None
+    notes: str | None = None
+    currency: str = "eur"
+
+
+@app.post("/api/admin/affiliates", dependencies=[Depends(require_admin)])
+def admin_create_affiliate(payload: AffiliateCreate):
+    try:
+        result = affiliate.create_affiliate(
+            name=payload.name,
+            email=payload.email,
+            payout_method=payload.payout_method,
+            commission_rate=payload.commission_rate,
+            custom_code=payload.custom_code,
+        )
+        # Includi il portal_token così l'admin può inviarlo all'affiliato per il login
+        aff = storage.get_affiliate_by_id(result["id"])
+        return {
+            **result,
+            "portal_login_url": f"{settings.base_url}/affiliate.html?t={aff['portal_token']}",
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+
+@app.get("/api/admin/affiliates", dependencies=[Depends(require_admin)])
+def admin_list_affiliates():
+    rows = storage.list_affiliates()
+    out = []
+    for r in rows:
+        d = dict(r)
+        stats = affiliate.affiliate_stats(d["id"])
+        out.append({**d, **stats})
+    return out
+
+
+@app.post("/api/admin/affiliates/{aff_id}/status", dependencies=[Depends(require_admin)])
+def admin_update_affiliate_status(aff_id: str, status: str):
+    if status not in ("active", "paused", "banned"):
+        raise HTTPException(status_code=422, detail="Status non valido")
+    storage.update_affiliate_status(aff_id, status)
+    return {"ok": True}
+
+
+@app.post("/api/admin/affiliates/approve-matured", dependencies=[Depends(require_admin)])
+def admin_approve_matured():
+    """
+    Promuove le commissioni 'pending' col payable_at scaduto a 'approved'.
+    Da chiamare manualmente o via cron giornaliero.
+    """
+    n = affiliate.approve_matured_commissions()
+    return {"approved": n}
+
+
+@app.get("/api/admin/affiliates/payouts-due", dependencies=[Depends(require_admin)])
+def admin_payouts_due():
+    """Snapshot di tutti gli affiliati con commissioni 'approved' in attesa di pagamento."""
+    rows = storage.list_all_approved_commissions_grouped()
+    return [dict(r) for r in rows]
+
+
+@app.post("/api/admin/affiliates/payouts", dependencies=[Depends(require_admin)])
+def admin_record_payout(body: AffiliatePayout):
+    """
+    Crea un payout e marca tutte le commissioni 'approved' di quell'affiliato come 'paid'.
+    Atomica nel DB: o tutto o niente.
+    """
+    aff = storage.get_affiliate_by_id(body.affiliate_id)
+    if not aff:
+        raise HTTPException(status_code=404, detail="Affiliate non trovato")
+    rows = storage.list_approved_commissions_for_payout(body.affiliate_id)
+    rows = [r for r in rows if (r["currency"] or "eur").lower() == body.currency.lower()]
+    if not rows:
+        raise HTTPException(status_code=400, detail="Nessuna commission approved da pagare")
+    total = sum(int(r["commission_amount_cents"]) for r in rows)
+    payout_id = storage.create_payout_and_mark_paid(
+        affiliate_id=body.affiliate_id,
+        amount_cents=total,
+        currency=body.currency.lower(),
+        method=body.method,
+        external_ref=body.external_ref,
+        notes=body.notes,
+    )
+    return {"payout_id": payout_id, "amount_cents": total, "commissions_paid": len(rows)}
+
+
+# ---------- Affiliate portal (pubblico, autenticato via token) ----------
+
+def _affiliate_from_token(token: str | None) -> Any:
+    if not token:
+        raise HTTPException(status_code=401, detail="Token mancante")
+    aff = storage.get_affiliate_by_portal_token(token)
+    if not aff:
+        raise HTTPException(status_code=401, detail="Token non valido")
+    return aff
+
+
+@app.get("/api/affiliate/me")
+@limiter.limit("60/minute")
+def affiliate_me(request: Request, t: str | None = None):
+    aff = _affiliate_from_token(t)
+    stats = affiliate.affiliate_stats(aff["id"])
+    return {
+        "id": aff["id"],
+        "name": aff["name"],
+        "email": aff["email"],
+        "ref_code": aff["ref_code"],
+        "referral_url": f"{settings.base_url}/?ref={aff['ref_code']}",
+        "commission_rate": aff["commission_rate"],
+        "status": aff["status"],
+        "stats": stats,
+    }
+
+
+@app.get("/api/affiliate/commissions")
+@limiter.limit("60/minute")
+def affiliate_commissions(request: Request, t: str | None = None):
+    aff = _affiliate_from_token(t)
+    rows = storage.list_commissions_for_affiliate(aff["id"])
+    return [dict(r) for r in rows]
+
+
+@app.get("/api/affiliate/payouts")
+@limiter.limit("60/minute")
+def affiliate_payouts(request: Request, t: str | None = None):
+    aff = _affiliate_from_token(t)
+    rows = storage.list_payouts_for_affiliate(aff["id"])
+    return [dict(r) for r in rows]
+
+
 # ---------- Pipeline di generazione ----------
 
 def _run_generation_pipeline(order_id: str) -> None:
@@ -481,12 +686,20 @@ def _run_generation_pipeline(order_id: str) -> None:
         if order.plan_chosen in ("completo", "coach"):
             # Recupera i Stripe ID salvati sull'ordine dal webhook
             fresh = storage.get_order(order_id)
+            # Recupera affiliate_ref dall'order così viene salvato sul subscriber:
+            # le invoice di rinnovo lo useranno per attribuire commissioni ricorrenti.
+            aff_ref = None
+            try:
+                aff_ref = storage.get_order_affiliate_ref(order_id)
+            except Exception:
+                log.exception("[%s] lookup affiliate_ref fallito — ignorato", order_id)
             sub_id = storage.create_subscriber(
                 order_id=order_id,
                 intake=order.intake,
                 targets=order.targets,
                 stripe_subscription_id=getattr(fresh, "stripe_subscription_id", None) if fresh else None,
                 stripe_customer_id=getattr(fresh, "stripe_customer_id", None) if fresh else None,
+                affiliate_ref=aff_ref,
             )
             log.info("[%s] subscriber creato: %s (prossimo piano in ~30 giorni)", order_id, sub_id)
 

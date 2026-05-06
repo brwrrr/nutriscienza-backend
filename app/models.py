@@ -46,6 +46,10 @@ class IntakeRequest(BaseModel):
     first_name: str = Field(alias="firstName", min_length=1, max_length=80)
     email: EmailStr
 
+    # Programma affiliati — opzionale. Catturato dal frontend dal param ?ref=
+    # in landing page e propagato al checkout. Nessun impatto se assente.
+    affiliate_ref: Optional[str] = Field(default=None, alias="affiliateRef", max_length=40)
+
     model_config = {"populate_by_name": True}
 
     @field_validator("dislikes", mode="before")

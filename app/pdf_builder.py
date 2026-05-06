@@ -278,7 +278,7 @@ def build_pdf(intake: IntakeRequest, targets: NutritionTargets, plan: MealPlan,
     """Genera il PDF e lo salva su `output_path`. Ritorna il path.
 
     `workout` è opzionale: se fornito (Completo/Coach), viene aggiunta la sezione
-    «Programma di allenamento» dopo i menù e prima dei consigli del nutrizionista.
+    «Programma di allenamento» dopo i menù e prima delle note metodologiche del piano.
     """
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     story = []
@@ -508,7 +508,7 @@ def build_pdf(intake: IntakeRequest, targets: NutritionTargets, plan: MealPlan,
         story.append(PageBreak())
 
     # ============ Note + disclaimer ============
-    story.append(Paragraph("NOTE DEL NUTRIZIONISTA", EYEBROW))
+    story.append(Paragraph("NOTE METODOLOGICHE DEL PIANO", EYEBROW))
     story.append(Paragraph("Cinque consigli che fanno la differenza.", H1))
 
     for i, tip in enumerate(plan.nutritionist_tips, 1):
@@ -546,12 +546,12 @@ def build_pdf(intake: IntakeRequest, targets: NutritionTargets, plan: MealPlan,
         Paragraph(
             "<b>Documento generato con intelligenza artificiale</b><br/>"
             "Questo piano è stato elaborato con il supporto di modelli di intelligenza "
-            "artificiale addestrati sui più aggiornati riferimenti nutrizionali internazionali "
-            "(LARN, EFSA, WHO/FAO) e sulle metodologie adottate dai principali nutrizionisti. "
+            "artificiale a partire da riferimenti nutrizionali pubblici e tracciabili: "
+            "linee guida LARN/SINU (IV revisione, 2014), riferimenti EFSA e WHO/FAO. "
             "I calcoli di fabbisogno energetico e dei macronutrienti sono deterministici e "
-            "basati sull'equazione di Mifflin-St Jeor, ampiamente validata in letteratura. "
+            "basati sull'equazione di Mifflin-St Jeor (1990), ampiamente validata in letteratura. "
             "Il piano non costituisce una diagnosi medica né sostituisce la consulenza "
-            "di un professionista sanitario abilitato.",
+            "di un medico, di un dietologo o di un biologo nutrizionista.",
             SMALL),
         Paragraph("<b>Hai domande sul tuo piano?</b><br/>"
                   "Scrivici a supporto@nutriscienza.org<br/>"

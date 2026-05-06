@@ -25,10 +25,19 @@ PLAN_MODE: dict[str, str] = {
 }
 
 
-def create_checkout_session(order_id: str, plan: Plan, email: str) -> stripe.checkout.Session:
+def create_checkout_session(
+    order_id: str,
+    plan: Plan,
+    email: str,
+    affiliate_ref: str | None = None,
+) -> stripe.checkout.Session:
     """Crea una Stripe Checkout Session per l'ordine."""
     price_id = settings.price_id_for_plan[plan]
     mode = PLAN_MODE[plan]
+
+    base_metadata: dict[str, str] = {"order_id": order_id, "plan": plan}
+    if affiliate_ref:
+        base_metadata["affiliate_ref"] = affiliate_ref
 
     session = stripe.checkout.Session.create(
         mode=mode,
@@ -36,11 +45,12 @@ def create_checkout_session(order_id: str, plan: Plan, email: str) -> stripe.che
         customer_email=email,
         success_url=f"{settings.base_url}/grazie?order_id={order_id}&session_id={{CHECKOUT_SESSION_ID}}",
         cancel_url=f"{settings.base_url}/questionario.html?annullato=1",
-        metadata={"order_id": order_id, "plan": plan},
+        metadata=base_metadata,
         # In subscription mode i metadata della session non si propagano in automatico
         # alla subscription — li mettiamo anche nei subscription_data per coerenza.
+        # Questo garantisce che affiliate_ref sopravviva ai rinnovi via subscription.metadata.
         subscription_data=(
-            {"metadata": {"order_id": order_id, "plan": plan}}
+            {"metadata": base_metadata}
             if mode == "subscription" else None
         ),
         locale="it",

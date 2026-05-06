@@ -56,6 +56,56 @@ CREATE TABLE IF NOT EXISTS subscribers (
 CREATE INDEX IF NOT EXISTS idx_subscribers_due ON subscribers(next_plan_due_at, subscription_status);
 CREATE INDEX IF NOT EXISTS idx_subscribers_stripe ON subscribers(stripe_subscription_id);
 CREATE INDEX IF NOT EXISTS idx_subscribers_email ON subscribers(email);
+
+-- ── Affiliate program ────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS affiliates (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    email TEXT NOT NULL UNIQUE,
+    ref_code TEXT NOT NULL UNIQUE,
+    commission_rate REAL NOT NULL DEFAULT 0.30,
+    payout_method TEXT NOT NULL DEFAULT 'manual',  -- 'manual' | 'wise' | 'paypal' | 'sepa'
+    payout_details TEXT,                            -- JSON
+    status TEXT NOT NULL DEFAULT 'active',          -- 'active' | 'paused' | 'banned'
+    portal_token TEXT UNIQUE,                       -- magic-link login token (rotated on use)
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_affiliates_ref ON affiliates(ref_code);
+CREATE INDEX IF NOT EXISTS idx_affiliates_email ON affiliates(email);
+
+CREATE TABLE IF NOT EXISTS commissions (
+    id TEXT PRIMARY KEY,
+    affiliate_id TEXT NOT NULL REFERENCES affiliates(id),
+    stripe_event_ref TEXT NOT NULL UNIQUE,         -- idempotency: 'cs:<id>' or 'inv:<id>'
+    order_id TEXT,                                  -- per Base
+    stripe_customer_id TEXT,
+    stripe_subscription_id TEXT,
+    plan TEXT NOT NULL,
+    gross_amount_cents INTEGER NOT NULL,
+    commission_amount_cents INTEGER NOT NULL,
+    currency TEXT NOT NULL DEFAULT 'eur',
+    status TEXT NOT NULL DEFAULT 'pending',         -- 'pending'|'approved'|'paid'|'reversed'
+    earned_at TEXT NOT NULL,
+    payable_at TEXT NOT NULL,
+    paid_at TEXT,
+    payout_id TEXT,
+    notes TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_commissions_affiliate ON commissions(affiliate_id, status);
+CREATE INDEX IF NOT EXISTS idx_commissions_payable ON commissions(status, payable_at);
+CREATE INDEX IF NOT EXISTS idx_commissions_subscription ON commissions(stripe_subscription_id);
+
+CREATE TABLE IF NOT EXISTS payouts (
+    id TEXT PRIMARY KEY,
+    affiliate_id TEXT NOT NULL REFERENCES affiliates(id),
+    amount_cents INTEGER NOT NULL,
+    currency TEXT NOT NULL DEFAULT 'eur',
+    method TEXT NOT NULL,
+    external_ref TEXT,                              -- transaction id su Wise/PayPal/SEPA
+    notes TEXT,
+    paid_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_payouts_affiliate ON payouts(affiliate_id);
 """
 
 
@@ -71,6 +121,8 @@ def init_db() -> None:
         # SQLite non supporta IF NOT EXISTS su ALTER TABLE — usiamo try/except.
         for _migration in [
             "ALTER TABLE subscribers ADD COLUMN checkin_token TEXT",
+            "ALTER TABLE orders ADD COLUMN affiliate_ref TEXT",
+            "ALTER TABLE subscribers ADD COLUMN affiliate_ref TEXT",
         ]:
             try:
                 c.execute(_migration)
@@ -90,19 +142,20 @@ def _conn():
         conn.close()
 
 
-def create_order(intake: IntakeRequest, targets: NutritionTargets) -> str:
+def create_order(intake: IntakeRequest, targets: NutritionTargets, affiliate_ref: str | None = None) -> str:
     order_id = "ord_" + uuid.uuid4().hex[:16]
     with _conn() as c:
         c.execute(
             """INSERT INTO orders (id, intake_json, targets_json, plan_chosen, email,
-                                   status, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, 'pending_payment', ?, ?)""",
+                                   status, affiliate_ref, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, 'pending_payment', ?, ?, ?)""",
             (
                 order_id,
                 intake.model_dump_json(by_alias=True),
                 targets.model_dump_json(),
                 intake.plan,
                 intake.email,
+                affiliate_ref,
                 _now_iso(),
                 _now_iso(),
             ),
@@ -179,6 +232,7 @@ def create_subscriber(
     targets: "NutritionTargets",
     stripe_subscription_id: str | None = None,
     stripe_customer_id: str | None = None,
+    affiliate_ref: str | None = None,
 ) -> str:
     """
     Called once after the initial plan is sent for completo/coach orders.
@@ -193,8 +247,8 @@ def create_subscriber(
             """INSERT INTO subscribers
                (id, order_id, email, first_name, intake_json, targets_json, plan,
                 stripe_subscription_id, stripe_customer_id, checkin_token,
-                last_plan_sent_at, next_plan_due_at, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                affiliate_ref, last_plan_sent_at, next_plan_due_at, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 sub_id,
                 order_id,
@@ -206,6 +260,7 @@ def create_subscriber(
                 stripe_subscription_id,
                 stripe_customer_id,
                 checkin_token,
+                affiliate_ref,
                 _now_iso(),   # last_plan_sent_at — the initial plan counts as month 1
                 next_due,
                 _now_iso(),
@@ -385,4 +440,295 @@ def get_latest_paid_orders(limit: int = 10) -> list[sqlite3.Row]:
                ORDER BY updated_at DESC
                LIMIT ?""",
             (limit,),
+        ).fetchall()
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Affiliate program — tutto additivo, nessuna funzione esistente toccata.
+# ────────────────────────────────────────────────────────────────────────────
+
+def get_order_affiliate_ref(order_id: str) -> Optional[str]:
+    with _conn() as c:
+        row = c.execute("SELECT affiliate_ref FROM orders WHERE id=?", (order_id,)).fetchone()
+    return row["affiliate_ref"] if row else None
+
+
+def get_order_affiliate_ref_by_subscription(stripe_subscription_id: str) -> sqlite3.Row | None:
+    """Fallback per quando il subscriber non è ancora stato creato."""
+    with _conn() as c:
+        return c.execute(
+            """SELECT affiliate_ref, email, plan_chosen
+               FROM orders
+               WHERE stripe_subscription_id=? AND affiliate_ref IS NOT NULL
+               LIMIT 1""",
+            (stripe_subscription_id,),
+        ).fetchone()
+
+
+def attach_affiliate_to_subscriber(stripe_subscription_id: str, affiliate_ref: str) -> None:
+    """
+    Backfill: il subscriber viene creato dopo il primo pagamento, ma l'affiliate_ref
+    è sull'order. Quando creiamo il subscriber lo passiamo direttamente; questa
+    funzione è qui per migrazioni / backfill manuali.
+    """
+    with _conn() as c:
+        c.execute(
+            "UPDATE subscribers SET affiliate_ref=? WHERE stripe_subscription_id=?",
+            (affiliate_ref, stripe_subscription_id),
+        )
+
+
+# ── Affiliates CRUD ──────────────────────────────────────────────────────────
+
+def create_affiliate(
+    name: str,
+    email: str,
+    ref_code: str,
+    commission_rate: float = 0.30,
+    payout_method: str = "manual",
+) -> str:
+    aff_id = "aff_" + uuid.uuid4().hex[:16]
+    portal_token = secrets.token_urlsafe(32)
+    with _conn() as c:
+        c.execute(
+            """INSERT INTO affiliates
+               (id, name, email, ref_code, commission_rate, payout_method,
+                status, portal_token, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)""",
+            (aff_id, name, email, ref_code, commission_rate, payout_method,
+             portal_token, _now_iso()),
+        )
+    return aff_id
+
+
+def get_affiliate_by_ref(ref_code: str) -> sqlite3.Row | None:
+    with _conn() as c:
+        return c.execute(
+            "SELECT * FROM affiliates WHERE ref_code=?", (ref_code,)
+        ).fetchone()
+
+
+def get_affiliate_by_email(email: str) -> sqlite3.Row | None:
+    with _conn() as c:
+        return c.execute(
+            "SELECT * FROM affiliates WHERE email=?", (email,)
+        ).fetchone()
+
+
+def get_affiliate_by_id(affiliate_id: str) -> sqlite3.Row | None:
+    with _conn() as c:
+        return c.execute(
+            "SELECT * FROM affiliates WHERE id=?", (affiliate_id,)
+        ).fetchone()
+
+
+def get_affiliate_by_portal_token(token: str) -> sqlite3.Row | None:
+    with _conn() as c:
+        return c.execute(
+            "SELECT * FROM affiliates WHERE portal_token=? AND status='active'",
+            (token,),
+        ).fetchone()
+
+
+def rotate_portal_token(affiliate_id: str) -> str:
+    new_token = secrets.token_urlsafe(32)
+    with _conn() as c:
+        c.execute(
+            "UPDATE affiliates SET portal_token=? WHERE id=?",
+            (new_token, affiliate_id),
+        )
+    return new_token
+
+
+def list_affiliates() -> list[sqlite3.Row]:
+    with _conn() as c:
+        return c.execute(
+            """SELECT id, name, email, ref_code, commission_rate, status, created_at
+               FROM affiliates ORDER BY created_at DESC"""
+        ).fetchall()
+
+
+def update_affiliate_status(affiliate_id: str, status: str) -> None:
+    with _conn() as c:
+        c.execute(
+            "UPDATE affiliates SET status=? WHERE id=?",
+            (status, affiliate_id),
+        )
+
+
+# ── Commissions ──────────────────────────────────────────────────────────────
+
+def create_commission(
+    *,
+    affiliate_id: str,
+    stripe_event_ref: str,
+    order_id: Optional[str],
+    stripe_customer_id: Optional[str],
+    stripe_subscription_id: Optional[str],
+    plan: str,
+    gross_amount_cents: int,
+    commission_amount_cents: int,
+    currency: str,
+    status: str,
+    earned_at: str,
+    payable_at: str,
+) -> Optional[str]:
+    """
+    Idempotente: la UNIQUE su stripe_event_ref previene doppi accrediti
+    in caso di webhook retry da Stripe. Ritorna None se la commission esiste già.
+    """
+    com_id = "com_" + uuid.uuid4().hex[:16]
+    try:
+        with _conn() as c:
+            c.execute(
+                """INSERT INTO commissions
+                   (id, affiliate_id, stripe_event_ref, order_id,
+                    stripe_customer_id, stripe_subscription_id, plan,
+                    gross_amount_cents, commission_amount_cents, currency,
+                    status, earned_at, payable_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (com_id, affiliate_id, stripe_event_ref, order_id,
+                 stripe_customer_id, stripe_subscription_id, plan,
+                 gross_amount_cents, commission_amount_cents, currency,
+                 status, earned_at, payable_at),
+            )
+        return com_id
+    except sqlite3.IntegrityError:
+        # Duplicate stripe_event_ref — webhook retry. Idempotent skip.
+        return None
+
+
+def reverse_commission_by_event_ref(stripe_event_ref: str) -> int:
+    with _conn() as c:
+        cur = c.execute(
+            """UPDATE commissions
+               SET status='reversed'
+               WHERE stripe_event_ref=? AND status IN ('pending', 'approved')""",
+            (stripe_event_ref,),
+        )
+        return cur.rowcount
+
+
+def approve_pending_commissions_due() -> int:
+    """Promuove pending → approved per tutte quelle col payable_at scaduto."""
+    with _conn() as c:
+        cur = c.execute(
+            """UPDATE commissions
+               SET status='approved'
+               WHERE status='pending' AND payable_at <= ?""",
+            (_now_iso(),),
+        )
+        return cur.rowcount
+
+
+def list_commissions_for_affiliate(
+    affiliate_id: str, limit: int = 200
+) -> list[sqlite3.Row]:
+    with _conn() as c:
+        return c.execute(
+            """SELECT id, stripe_event_ref, plan, gross_amount_cents,
+                      commission_amount_cents, currency, status,
+                      earned_at, payable_at, paid_at
+               FROM commissions
+               WHERE affiliate_id=?
+               ORDER BY earned_at DESC LIMIT ?""",
+            (affiliate_id, limit),
+        ).fetchall()
+
+
+def list_approved_commissions_for_payout(affiliate_id: str) -> list[sqlite3.Row]:
+    with _conn() as c:
+        return c.execute(
+            """SELECT id, commission_amount_cents, currency
+               FROM commissions
+               WHERE affiliate_id=? AND status='approved'""",
+            (affiliate_id,),
+        ).fetchall()
+
+
+def list_all_approved_commissions_grouped() -> list[sqlite3.Row]:
+    """Per export CSV admin: chi è da pagare e quanto."""
+    with _conn() as c:
+        return c.execute(
+            """SELECT a.id as affiliate_id, a.name, a.email, a.ref_code,
+                      a.payout_method, a.payout_details,
+                      SUM(c.commission_amount_cents) as total_cents,
+                      c.currency,
+                      COUNT(c.id) as commission_count
+               FROM commissions c
+               JOIN affiliates a ON a.id = c.affiliate_id
+               WHERE c.status='approved'
+               GROUP BY a.id, c.currency
+               HAVING total_cents > 0
+               ORDER BY total_cents DESC"""
+        ).fetchall()
+
+
+def sum_commissions(affiliate_id: str, status: str) -> int:
+    with _conn() as c:
+        row = c.execute(
+            """SELECT COALESCE(SUM(commission_amount_cents), 0) as s
+               FROM commissions
+               WHERE affiliate_id=? AND status=?""",
+            (affiliate_id, status),
+        ).fetchone()
+    return int(row["s"] or 0)
+
+
+def count_unique_referrals(affiliate_id: str) -> int:
+    """Numero di clienti unici (per email) generati dall'affiliato."""
+    with _conn() as c:
+        row = c.execute(
+            """SELECT COUNT(DISTINCT o.email) as n
+               FROM orders o
+               WHERE o.affiliate_ref = (SELECT ref_code FROM affiliates WHERE id=?)
+                 AND o.status IN ('paid', 'generating', 'sent')""",
+            (affiliate_id,),
+        ).fetchone()
+    return int(row["n"] or 0)
+
+
+# ── Payouts ──────────────────────────────────────────────────────────────────
+
+def create_payout_and_mark_paid(
+    affiliate_id: str,
+    amount_cents: int,
+    currency: str,
+    method: str,
+    external_ref: str | None,
+    notes: str | None,
+) -> str:
+    """
+    Atomica: crea il record payout E marca tutte le commissions 'approved'
+    di quell'affiliato come 'paid' con FK al payout. Garantisce coerenza:
+    nessuna commission paid senza payout, nessun payout senza commissioni.
+    """
+    payout_id = "pay_" + uuid.uuid4().hex[:16]
+    now = _now_iso()
+    with _conn() as c:
+        c.execute(
+            """INSERT INTO payouts
+               (id, affiliate_id, amount_cents, currency, method,
+                external_ref, notes, paid_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (payout_id, affiliate_id, amount_cents, currency, method,
+             external_ref, notes, now),
+        )
+        c.execute(
+            """UPDATE commissions
+               SET status='paid', paid_at=?, payout_id=?
+               WHERE affiliate_id=? AND status='approved' AND currency=?""",
+            (now, payout_id, affiliate_id, currency),
+        )
+    return payout_id
+
+
+def list_payouts_for_affiliate(affiliate_id: str) -> list[sqlite3.Row]:
+    with _conn() as c:
+        return c.execute(
+            """SELECT id, amount_cents, currency, method, external_ref, paid_at
+               FROM payouts
+               WHERE affiliate_id=?
+               ORDER BY paid_at DESC""",
+            (affiliate_id,),
         ).fetchall()
