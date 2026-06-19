@@ -29,6 +29,7 @@ Come eseguirlo
 import logging
 import sqlite3
 import traceback
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .config import settings
@@ -46,9 +47,101 @@ logging.basicConfig(
 log = logging.getLogger("nutriscienza.scheduler")
 
 
+# Finestra di guardia: se un piano è già stato inviato negli ultimi N giorni,
+# un secondo trigger NON ricarica il piano (evita doppio invio quando il
+# webhook del rinnovo e lo sweep giornaliero si sovrappongono). Il pulsante
+# manuale dell'admin usa force=True e bypassa questa guardia.
+RECENT_SEND_GUARD_DAYS = 25
+
+
+def refresh_subscriber(
+    sub_id: str,
+    *,
+    force: bool = False,
+    invoice_id: str | None = None,
+    reason: str = "cron",
+) -> str:
+    """
+    Genera e invia il piano del mese successivo per UN subscriber.
+
+    Punto d'ingresso unico condiviso da: webhook rinnovo Stripe, sweep
+    giornaliero (cron/endpoint) e pulsante manuale admin. Gestisce da sé
+    errori e idempotenza — non solleva mai (sicuro come BackgroundTask).
+
+    Ritorna uno stato: "sent" | "failed" | "skipped:not_found"
+    | "skipped:inactive" | "skipped:duplicate" | "skipped:recent".
+    """
+    row = storage.get_subscriber_by_id(sub_id)
+    if row is None:
+        log.warning("refresh_subscriber: subscriber %s non trovato (reason=%s)", sub_id, reason)
+        return "skipped:not_found"
+
+    email: str = row["email"]
+    plan_month: int = row["plan_month"] + 1  # next month to send
+
+    # Idempotenza forte: stesso invoice Stripe già fulfillato → skip.
+    if invoice_id and row["last_invoice_id"] == invoice_id:
+        log.info("[%s] invoice %s già processato — skip (reason=%s)", sub_id, invoice_id, reason)
+        return "skipped:duplicate"
+
+    if not force:
+        if row["subscription_status"] != "active":
+            log.info("[%s] status=%s non attivo — skip (reason=%s)",
+                     sub_id, row["subscription_status"], reason)
+            return "skipped:inactive"
+
+        # Idempotenza temporale: piano già inviato di recente in questo ciclo.
+        last_sent = row["last_plan_sent_at"]
+        if last_sent:
+            try:
+                last_dt = datetime.fromisoformat(last_sent)
+                if datetime.now(timezone.utc) - last_dt < timedelta(days=RECENT_SEND_GUARD_DAYS):
+                    log.info("[%s] piano già inviato il %s (<%dgg) — skip (reason=%s)",
+                             sub_id, last_sent, RECENT_SEND_GUARD_DAYS, reason)
+                    return "skipped:recent"
+            except ValueError:
+                pass  # data malformata → procedi col refresh
+
+    log.info("[%s] inizio refresh — %s (mese %d, reason=%s, force=%s)",
+             sub_id, email, plan_month, reason, force)
+    try:
+        _deliver_plan(row, plan_month)
+        storage.mark_plan_sent(sub_id, invoice_id=invoice_id)
+        log.info("[%s] ✓ piano mese %d inviato a %s", sub_id, plan_month, email)
+        return "sent"
+    except Exception as exc:
+        err_text = f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
+        log.error("[%s] ✗ refresh fallito per %s:\n%s", sub_id, email, err_text)
+        try:
+            send_admin_failure(
+                order_id=f"sub:{sub_id}",
+                error=f"Refresh mese {plan_month} fallito per {email} (reason={reason})\n\n{err_text}",
+            )
+        except Exception:
+            log.exception("[%s] impossibile inviare notifica admin", sub_id)
+        return "failed"
+
+
+def refresh_by_stripe_subscription(stripe_sub_id: str, invoice_id: str | None = None) -> str:
+    """
+    Mappa una subscription Stripe al subscriber interno e ne fa il refresh.
+    Usato dal webhook `invoice.payment_succeeded` sui rinnovi: il cliente ha
+    appena pagato → consegniamo subito il piano, senza dipendere dal cron.
+    """
+    row = storage.get_subscriber_by_stripe_sub(stripe_sub_id)
+    if row is None:
+        log.warning("refresh_by_stripe_subscription: nessun subscriber per sub %s", stripe_sub_id)
+        return "skipped:not_found"
+    return refresh_subscriber(row["id"], invoice_id=invoice_id, reason="stripe_renewal")
+
+
 def run() -> dict[str, int]:
     """
-    Entry point del cron job.
+    Entry point dello sweep giornaliero (cron / endpoint admin).
+
+    Backstop self-healing: processa ogni subscriber attivo con
+    next_plan_due_at <= adesso non ancora servito in questo ciclo.
+    Il percorso primario è il webhook del rinnovo Stripe.
 
     Ritorna un dizionario con i contatori del run:
         {"due": N, "success": N, "skipped": N, "failed": N}
@@ -61,31 +154,13 @@ def run() -> dict[str, int]:
     counts = {"due": len(due_rows), "success": 0, "skipped": 0, "failed": 0}
 
     for row in due_rows:
-        sub_id: str = row["id"]
-        email: str = row["email"]
-        first_name: str = row["first_name"]
-        plan: str = row["plan"]
-        plan_month: int = row["plan_month"] + 1  # next month to send
-
-        log.info("[%s] inizio refresh — %s (mese %d)", sub_id, email, plan_month)
-
-        try:
-            _refresh_one(row, plan_month)
+        status = refresh_subscriber(row["id"], reason="cron")
+        if status == "sent":
             counts["success"] += 1
-            log.info("[%s] ✓ piano mese %d inviato a %s", sub_id, plan_month, email)
-
-        except Exception as exc:
+        elif status == "failed":
             counts["failed"] += 1
-            err_text = f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
-            log.error("[%s] ✗ refresh fallito per %s:\n%s", sub_id, email, err_text)
-            # Notifica admin via email — non rilanciare l'eccezione
-            try:
-                send_admin_failure(
-                    order_id=f"sub:{sub_id}",
-                    error=f"Refresh mese {plan_month} fallito per {email}\n\n{err_text}",
-                )
-            except Exception:
-                log.exception("[%s] impossibile inviare notifica admin", sub_id)
+        else:
+            counts["skipped"] += 1
 
     # ── Affiliate: promuovi le commissioni mature ────────────────────────
     # Pending → approved per quelle col payable_at scaduto (30gg di hold).
@@ -107,9 +182,11 @@ def run() -> dict[str, int]:
     return counts
 
 
-def _refresh_one(row: sqlite3.Row, plan_month: int) -> None:
+def _deliver_plan(row: sqlite3.Row, plan_month: int) -> None:
     """
-    Pipeline completa per un singolo subscriber.
+    Pipeline completa per un singolo subscriber: rigenera piano, costruisce PDF,
+    invia email. NON aggiorna il DB — è il chiamante (refresh_subscriber) a
+    chiamare mark_plan_sent così da controllare idempotenza e invoice_id.
     Solleva eccezione se qualcosa va storto — il chiamante gestisce il fallimento.
     """
     sub_id: str = row["id"]
@@ -161,9 +238,6 @@ def _refresh_one(row: sqlite3.Row, plan_month: int) -> None:
         checkin_url=checkin_url,
     )
     log.info("[%s] email inviata (resend_id=%s)", sub_id, resend_id)
-
-    # 6. Aggiorna next_plan_due_at nel DB — fa avanzare l'orologio di 30 giorni
-    storage.mark_plan_sent(sub_id)
 
 
 if __name__ == "__main__":

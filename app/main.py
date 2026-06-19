@@ -32,7 +32,7 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
-from . import affiliate, storage
+from . import affiliate, scheduler, storage
 from .config import settings
 from .email_sender import send_admin_failure, send_cancellation_email, send_plan_email
 from .models import IntakeRequest
@@ -223,17 +223,24 @@ async def stripe_webhook(
 
     elif event["type"] == "invoice.payment_succeeded":
         # Stripe fires this on every successful subscription renewal.
-        # We use it to keep subscriber status in sync. The actual plan
-        # regeneration is handled by scheduler.py (cron), not here — this
-        # keeps the webhook handler fast and simple.
+        # Questo è il percorso PRIMARIO di consegna del piano del nuovo mese:
+        # il cliente ha appena pagato → generiamo e inviamo subito, in-process
+        # (stesso DB del web service). Lo sweep giornaliero resta come backstop.
         invoice: dict[str, Any] = event["data"]["object"]
         sub_id = invoice.get("subscription")
+        invoice_id = invoice.get("id")
         if sub_id:
             # billing_reason == 'subscription_create' means first payment — already
             # handled by checkout.session.completed, so skip to avoid double-generating.
             if invoice.get("billing_reason") != "subscription_create":
                 storage.set_subscriber_status(sub_id, "active")
-                log.info("Rinnovo confermato per subscription %s — cron genererà il piano", sub_id)
+                log.info("Rinnovo confermato per subscription %s (inv=%s) — genero il piano",
+                         sub_id, invoice_id)
+                # Lavoro pesante (Claude + PDF + email) in background: Stripe vuole <5s.
+                # refresh_by_stripe_subscription è idempotente sull'invoice_id.
+                background_tasks.add_task(
+                    scheduler.refresh_by_stripe_subscription, sub_id, invoice_id
+                )
 
         # ── Commissione affiliato (subscription) ──────────────────────────
         # Bookiamo per OGNI invoice paid (incluso il primo pagamento).
@@ -519,6 +526,34 @@ def admin_orders(limit: int = 100, offset: int = 0):
 def admin_subscribers():
     rows = storage.get_all_subscribers()
     return [dict(r) for r in rows]
+
+
+@app.post("/api/admin/subscribers/{sub_id}/send-plan", dependencies=[Depends(require_admin)])
+def admin_send_plan(sub_id: str, background_tasks: BackgroundTasks):
+    """
+    Invio MANUALE del piano del mese successivo per un subscriber.
+    Rete di sicurezza se un rinnovo non è stato consegnato in automatico.
+    force=True: bypassa le guardie di idempotenza temporale/stato — l'admin
+    sa cosa sta facendo. Lavoro pesante in background.
+    """
+    row = storage.get_subscriber_by_id(sub_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Subscriber non trovato")
+    background_tasks.add_task(
+        scheduler.refresh_subscriber, sub_id, force=True, reason="admin_manual"
+    )
+    return {"queued": True, "subscriber_id": sub_id, "email": row["email"]}
+
+
+@app.post("/api/admin/run-refresh", dependencies=[Depends(require_admin)])
+def admin_run_refresh(background_tasks: BackgroundTasks):
+    """
+    Esegue lo sweep giornaliero IN-PROCESS (stesso DB del web service).
+    Da invocare da un Render Cron Job via HTTP (curl) invece di
+    `python -m app.scheduler`, che girerebbe su un DB separato e vuoto.
+    """
+    background_tasks.add_task(scheduler.run)
+    return {"queued": True}
 
 
 @app.post("/api/admin/orders/{order_id}/retry", dependencies=[Depends(require_admin)])

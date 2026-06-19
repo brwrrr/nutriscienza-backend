@@ -123,6 +123,8 @@ def init_db() -> None:
             "ALTER TABLE subscribers ADD COLUMN checkin_token TEXT",
             "ALTER TABLE orders ADD COLUMN affiliate_ref TEXT",
             "ALTER TABLE subscribers ADD COLUMN affiliate_ref TEXT",
+            # Idempotenza rinnovi: ultimo invoice Stripe già fulfillato per il subscriber.
+            "ALTER TABLE subscribers ADD COLUMN last_invoice_id TEXT",
         ]:
             try:
                 c.execute(_migration)
@@ -286,18 +288,40 @@ def get_subscribers_due_for_refresh() -> list[sqlite3.Row]:
     return rows
 
 
-def mark_plan_sent(subscriber_id: str) -> None:
-    """Called after a refresh plan has been successfully emailed. Advances the clock 30 days."""
+def mark_plan_sent(subscriber_id: str, invoice_id: str | None = None) -> None:
+    """Called after a refresh plan has been successfully emailed. Advances the clock 30 days.
+
+    Se `invoice_id` è fornito (rinnovo via webhook Stripe) lo registra su
+    last_invoice_id per garantire l'idempotenza: lo stesso invoice non
+    rigenera mai due volte il piano, anche con retry del webhook.
+    """
     from datetime import timedelta
     now_dt = datetime.now(timezone.utc)
     next_due = (now_dt + timedelta(days=30)).isoformat()
     with _conn() as c:
-        c.execute(
-            """UPDATE subscribers
-               SET last_plan_sent_at=?, next_plan_due_at=?, plan_month=plan_month+1
-               WHERE id=?""",
-            (now_dt.isoformat(), next_due, subscriber_id),
-        )
+        if invoice_id is not None:
+            c.execute(
+                """UPDATE subscribers
+                   SET last_plan_sent_at=?, next_plan_due_at=?, plan_month=plan_month+1,
+                       last_invoice_id=?
+                   WHERE id=?""",
+                (now_dt.isoformat(), next_due, invoice_id, subscriber_id),
+            )
+        else:
+            c.execute(
+                """UPDATE subscribers
+                   SET last_plan_sent_at=?, next_plan_due_at=?, plan_month=plan_month+1
+                   WHERE id=?""",
+                (now_dt.isoformat(), next_due, subscriber_id),
+            )
+
+
+def get_subscriber_by_id(subscriber_id: str) -> sqlite3.Row | None:
+    with _conn() as c:
+        return c.execute(
+            "SELECT * FROM subscribers WHERE id=?",
+            (subscriber_id,),
+        ).fetchone()
 
 
 def cancel_subscriber(stripe_subscription_id: str) -> None:
