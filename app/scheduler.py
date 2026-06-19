@@ -192,6 +192,43 @@ def _checkin_url(row: sqlite3.Row) -> str:
     return f"{settings.base_url}/checkin.html?token={token}" if token else ""
 
 
+def request_checkin_for_subscriber(sub_id: str, invoice_id: str | None = None) -> str:
+    """
+    Apre un ciclo di check-in per il subscriber e invia l'email di richiesta.
+
+    Usato sia dal rinnovo Stripe (invoice_id valorizzato) sia dal trigger manuale
+    admin (invoice_id None). Sul trigger manuale, se il ciclo è già aperto,
+    rimandiamo comunque l'email (re-invio del sollecito). Non solleva mai.
+    """
+    row = storage.get_subscriber_by_id(sub_id)
+    if row is None:
+        log.warning("request_checkin: subscriber %s non trovato", sub_id)
+        return "skipped:not_found"
+
+    plan_month = row["plan_month"] + 1
+    status = storage.open_checkin_cycle(sub_id, plan_month=plan_month, invoice_id=invoice_id)
+    # 'opened' = nuovo ciclo; 'skipped:already_open' = ciclo manuale già aperto → re-invio.
+    if status not in ("opened", "skipped:already_open"):
+        log.info("[%s] ciclo check-in non aperto (%s) inv=%s", sub_id, status, invoice_id)
+        return status
+
+    fresh = storage.get_subscriber_by_id(sub_id)
+    pending_month = fresh["pending_plan_month"] or plan_month
+    try:
+        send_checkin_request_email(
+            email=fresh["email"],
+            first_name=fresh["first_name"],
+            plan_month=pending_month,
+            checkin_url=_checkin_url(fresh),
+        )
+        log.info("[%s] email richiesta check-in inviata (mese %d, %s)",
+                 sub_id, pending_month, status)
+    except Exception:
+        log.exception("[%s] invio richiesta check-in fallito", sub_id)
+        return "opened:email_failed"
+    return status
+
+
 def request_checkin_by_stripe_subscription(stripe_sub_id: str, invoice_id: str | None = None) -> str:
     """
     Percorso PRIMARIO sui rinnovi (webhook `invoice.payment_succeeded`).
@@ -207,27 +244,7 @@ def request_checkin_by_stripe_subscription(stripe_sub_id: str, invoice_id: str |
     if row is None:
         log.warning("request_checkin: nessun subscriber per sub %s", stripe_sub_id)
         return "skipped:not_found"
-
-    plan_month = row["plan_month"] + 1
-    status = storage.open_checkin_cycle(row["id"], plan_month=plan_month, invoice_id=invoice_id)
-    if status != "opened":
-        log.info("[%s] ciclo check-in non aperto (%s) inv=%s", row["id"], status, invoice_id)
-        return status
-
-    # Ricarica per avere il token corrente e invia la richiesta di check-in.
-    fresh = storage.get_subscriber_by_id(row["id"])
-    try:
-        send_checkin_request_email(
-            email=fresh["email"],
-            first_name=fresh["first_name"],
-            plan_month=plan_month,
-            checkin_url=_checkin_url(fresh),
-        )
-        log.info("[%s] email richiesta check-in inviata (mese %d)", row["id"], plan_month)
-    except Exception:
-        log.exception("[%s] invio richiesta check-in fallito", row["id"])
-        return "opened:email_failed"
-    return "opened"
+    return request_checkin_for_subscriber(row["id"], invoice_id=invoice_id)
 
 
 def _send_due_reminders() -> dict[str, int]:

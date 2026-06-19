@@ -106,6 +106,22 @@ CREATE TABLE IF NOT EXISTS payouts (
     paid_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_payouts_affiliate ON payouts(affiliate_id);
+
+-- ── Rinnovi abbonamento ──────────────────────────────────────────────────────
+-- I rinnovi mensili (invoice.payment_succeeded, billing_reason != subscription_create)
+-- NON creano un nuovo ordine. Li registriamo qui per includerli nei totali della
+-- dashboard. Idempotente sull'invoice Stripe (UNIQUE) contro i retry del webhook.
+CREATE TABLE IF NOT EXISTS renewals (
+    id TEXT PRIMARY KEY,
+    stripe_invoice_id TEXT NOT NULL UNIQUE,
+    stripe_subscription_id TEXT,
+    plan TEXT NOT NULL,
+    amount_cents INTEGER NOT NULL,
+    currency TEXT NOT NULL DEFAULT 'eur',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_renewals_created ON renewals(created_at);
+CREATE INDEX IF NOT EXISTS idx_renewals_sub ON renewals(stripe_subscription_id);
 """
 
 
@@ -616,6 +632,57 @@ def get_latest_paid_orders(limit: int = 10) -> list[sqlite3.Row]:
                WHERE status IN ('paid', 'generating', 'sent')
                ORDER BY updated_at DESC
                LIMIT ?""",
+            (limit,),
+        ).fetchall()
+
+
+# ── Rinnovi abbonamento (per i totali della dashboard) ──────────────────────────
+
+def record_renewal(
+    stripe_invoice_id: str,
+    stripe_subscription_id: str | None,
+    plan: str,
+    amount_cents: int,
+    currency: str = "eur",
+) -> Optional[str]:
+    """
+    Registra un pagamento di rinnovo. Idempotente sull'invoice Stripe: un retry
+    del webhook non duplica il ricavo. Ritorna None se già registrato.
+    """
+    ren_id = "ren_" + uuid.uuid4().hex[:16]
+    try:
+        with _conn() as c:
+            c.execute(
+                """INSERT INTO renewals
+                   (id, stripe_invoice_id, stripe_subscription_id, plan,
+                    amount_cents, currency, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (ren_id, stripe_invoice_id, stripe_subscription_id, plan,
+                 amount_cents, currency, _now_iso()),
+            )
+        return ren_id
+    except sqlite3.IntegrityError:
+        return None  # invoice già registrato (retry webhook)
+
+
+def get_renewals_since(since_iso: str) -> list[sqlite3.Row]:
+    """Rinnovi registrati dal timestamp dato — per i totali per periodo."""
+    with _conn() as c:
+        return c.execute(
+            """SELECT plan, amount_cents, currency, created_at
+               FROM renewals
+               WHERE created_at >= ?
+               ORDER BY created_at DESC""",
+            (since_iso,),
+        ).fetchall()
+
+
+def get_latest_renewals(limit: int = 10) -> list[sqlite3.Row]:
+    """Rinnovi più recenti per la lista transazioni della dashboard."""
+    with _conn() as c:
+        return c.execute(
+            """SELECT stripe_subscription_id, plan, amount_cents, created_at
+               FROM renewals ORDER BY created_at DESC LIMIT ?""",
             (limit,),
         ).fetchall()
 

@@ -245,6 +245,23 @@ async def stripe_webhook(
                     scheduler.request_checkin_by_stripe_subscription, sub_id, invoice_id
                 )
 
+                # Registra il ricavo del rinnovo per i totali della dashboard.
+                # I rinnovi non creano ordini, quindi senza questo non comparirebbero.
+                try:
+                    sub_row = storage.get_subscriber_by_stripe_sub(sub_id)
+                    plan = sub_row["plan"] if sub_row else "completo"
+                    amount_paid = int(invoice.get("amount_paid") or 0)
+                    if invoice_id and amount_paid > 0:
+                        storage.record_renewal(
+                            stripe_invoice_id=invoice_id,
+                            stripe_subscription_id=sub_id,
+                            plan=plan,
+                            amount_cents=amount_paid,
+                            currency=(invoice.get("currency") or "eur").lower(),
+                        )
+                except Exception:
+                    log.exception("Registrazione rinnovo fallita inv=%s — ignorata", invoice_id)
+
         # ── Commissione affiliato (subscription) ──────────────────────────
         # Bookiamo per OGNI invoice paid (incluso il primo pagamento).
         # Idempotenza garantita dalla UNIQUE su stripe_event_ref=inv:<id>.
@@ -489,12 +506,19 @@ def _stripe_fee_cents(amount_cents: int) -> int:
     return int(amount_cents * STRIPE_FEE_PCT) + STRIPE_FEE_FIXED_CENTS
 
 
-def _aggregate_period(rows) -> dict:
-    """Aggrega ricavi e costi su una lista di ordini paid+."""
+def _aggregate_period(rows, renewal_rows=()) -> dict:
+    """
+    Aggrega ricavi e costi su una lista di ordini paid+ E sui rinnovi del periodo.
+
+    Gli ordini usano il listino (PLAN_PRICE_CENTS); i rinnovi usano l'importo reale
+    pagato (amount_cents da Stripe). Entrambi contribuiscono a ricavi, costi API,
+    fee Stripe e profitto, così i totali includono gli abbonamenti ricorrenti.
+    """
     revenue = 0
     api_cost = 0
     stripe_fee = 0
     by_plan: dict[str, int] = {}
+
     for r in rows:
         plan = r["plan_chosen"]
         price = PLAN_PRICE_CENTS.get(plan, 0)
@@ -502,9 +526,25 @@ def _aggregate_period(rows) -> dict:
         api_cost += PLAN_API_COST_CENTS.get(plan, 0)
         stripe_fee += _stripe_fee_cents(price)
         by_plan[plan] = by_plan.get(plan, 0) + 1
+
+    renewals_count = 0
+    renewal_revenue = 0
+    for r in renewal_rows:
+        renewals_count += 1
+        plan = r["plan"]
+        amt = int(r["amount_cents"] or 0)
+        revenue += amt
+        renewal_revenue += amt
+        api_cost += PLAN_API_COST_CENTS.get(plan, 0)
+        stripe_fee += _stripe_fee_cents(amt)
+        by_plan[plan] = by_plan.get(plan, 0) + 1
+
     total_cost = api_cost + stripe_fee
     return {
-        "count": len(rows),
+        "count": len(rows) + renewals_count,
+        "orders_count": len(rows),
+        "renewals_count": renewals_count,
+        "renewal_revenue_cents": renewal_revenue,
         "revenue_cents": revenue,
         "api_cost_cents": api_cost,
         "stripe_fee_cents": stripe_fee,
@@ -530,6 +570,10 @@ def admin_dashboard():
     rows_week = storage.get_paid_orders_since(week_start.isoformat())
     rows_month = storage.get_paid_orders_since(month_start.isoformat())
 
+    ren_today = storage.get_renewals_since(today_start.isoformat())
+    ren_week = storage.get_renewals_since(week_start.isoformat())
+    ren_month = storage.get_renewals_since(month_start.isoformat())
+
     plan_distribution = storage.count_orders_by_plan_paid()
     active_subscribers = storage.count_subscribers_by_plan_active()
     latest = storage.get_latest_paid_orders(limit=10)
@@ -545,11 +589,23 @@ def admin_dashboard():
             "status": r["status"],
             "date": r["updated_at"],
         })
+    # Includi anche i rinnovi così la lista riflette i totali.
+    for r in storage.get_latest_renewals(limit=10):
+        latest_transactions.append({
+            "id": r["stripe_subscription_id"] or "—",
+            "plan": r["plan"],
+            "email": "↻ rinnovo",
+            "amount_cents": int(r["amount_cents"] or 0),
+            "status": "renewal",
+            "date": r["created_at"],
+        })
+    latest_transactions.sort(key=lambda x: x["date"] or "", reverse=True)
+    latest_transactions = latest_transactions[:10]
 
     return {
-        "today": _aggregate_period(rows_today),
-        "week": _aggregate_period(rows_week),
-        "month": _aggregate_period(rows_month),
+        "today": _aggregate_period(rows_today, ren_today),
+        "week": _aggregate_period(rows_week, ren_week),
+        "month": _aggregate_period(rows_month, ren_month),
         "plan_distribution_lifetime": plan_distribution,
         "active_subscribers_by_plan": active_subscribers,
         "latest_transactions": latest_transactions,
@@ -583,6 +639,25 @@ def admin_send_plan(sub_id: str, background_tasks: BackgroundTasks):
     background_tasks.add_task(
         scheduler.refresh_subscriber, sub_id, force=True, reason="admin_manual"
     )
+    return {"queued": True, "subscriber_id": sub_id, "email": row["email"]}
+
+
+@app.post("/api/admin/subscribers/{sub_id}/request-checkin", dependencies=[Depends(require_admin)])
+def admin_request_checkin(sub_id: str, background_tasks: BackgroundTasks):
+    """
+    Trigger MANUALE del flusso check-in: apre un ciclo e invia l'email di richiesta
+    al cliente. Il piano verrà generato quando completa il check-in — esattamente
+    come per un rinnovo. Usalo per (ri)avviare il loop senza forzare la consegna.
+    """
+    row = storage.get_subscriber_by_id(sub_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Subscriber non trovato")
+    if row["plan"] not in ("completo", "coach"):
+        raise HTTPException(
+            status_code=400,
+            detail="Il check-in mensile riguarda solo i piani in abbonamento (Completo/Coach).",
+        )
+    background_tasks.add_task(scheduler.request_checkin_for_subscriber, sub_id)
     return {"queued": True, "subscriber_id": sub_id, "email": row["email"]}
 
 
