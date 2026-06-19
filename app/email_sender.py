@@ -106,12 +106,22 @@ def send_plan_email(intake: IntakeRequest, pdf_path: str, manage_url: str = "") 
     return response["id"]
 
 
-def _refresh_email_html(first_name: str, plan: str, plan_month: int, checkin_url: str = "") -> str:
+def _refresh_email_html(first_name: str, plan: str, plan_month: int, checkin_url: str = "",
+                        progress_note: str = "") -> str:
     plan_desc = PLAN_DESCRIPTIONS.get(plan, plan)
     ordinal = {
         1: "primo", 2: "secondo", 3: "terzo", 4: "quarto", 5: "quinto",
         6: "sesto", 7: "settimo", 8: "ottavo", 9: "nono", 10: "decimo",
     }.get(plan_month, f"{plan_month}°")
+    # Riga personale basata sul progresso dichiarato al check-in (peso precedente
+    # vs nuovo). Calcolata a monte in scheduler.compute_progress_note — qui la
+    # mostriamo solo se presente.
+    progress_block = ""
+    if progress_note:
+        progress_block = f"""
+      <div style="background:#FBF6EA;border-left:3px solid #C9A66B;padding:14px 18px;border-radius:0 6px 6px 0;margin:0 0 8px;font-size:15px;line-height:1.55;color:#7A5C20;">
+        {progress_note}
+      </div>"""
     return f"""\
 <!DOCTYPE html>
 <html lang="it">
@@ -128,28 +138,19 @@ def _refresh_email_html(first_name: str, plan: str, plan_month: int, checkin_url
       </p>
       <h1 style="font-family:Georgia,serif;font-size:28px;color:#2D5F3F;margin:0 0 16px;line-height:1.2;">
         Ciao {first_name}, il tuo {ordinal} mese è pronto.
-      </h1>
+      </h1>{progress_block}
       <p style="font-size:15px;line-height:1.6;color:#2A2A2A;">
-        Trovi in allegato il piano del tuo <strong>{plan_month}° mese</strong> con il {plan_desc}.
-        Ogni mese il piano viene rielaborato per tenerti in progressione — stessi principi nutrizionali,
-        varietà nei pasti per non annoiarti.
+        Grazie per il check-in! Trovi in allegato il piano del tuo <strong>{plan_month}° mese</strong>
+        con il {plan_desc}, ricalcolato sul peso che ci hai appena comunicato — stessi principi
+        nutrizionali, varietà nei pasti per non annoiarti.
       </p>
       <div style="background:#E8F0EB;border-left:3px solid #2D5F3F;padding:14px 18px;border-radius:0 6px 6px 0;margin:24px 0;font-size:14px;line-height:1.55;">
         <strong style="color:#2D5F3F;">Come usare al meglio il piano di questo mese:</strong>
         <ol style="margin:8px 0 0;padding-left:18px;">
           <li>Confrontalo con quello del mese scorso — nota le variazioni caloriche.</li>
           <li>Usa la lista della spesa aggiornata per fare la spesa il weekend.</li>
-          <li>Se hai perso o guadagnato peso, i tuoi target sono stati ricalcolati automaticamente.</li>
+          <li>I tuoi target sono stati ricalcolati sul peso che hai indicato al check-in.</li>
         </ol>
-      </div>
-      <p style="font-size:15px;line-height:1.6;color:#2A2A2A;margin-top:24px;">
-        Il piano del prossimo mese verrà generato con il peso che hai adesso.<br>
-        <strong>Hai cambiato peso? Aggiornalo in 10 secondi:</strong>
-      </p>
-      <div style="text-align:center;margin:20px 0;">
-        <a href="{checkin_url}" style="display:inline-block;background:#2D5F3F;color:white;padding:12px 28px;border-radius:8px;font-weight:700;text-decoration:none;font-size:15px;">
-          Aggiorna il mio peso →
-        </a>
       </div>
       <p style="font-size:13px;color:#6B6B6B;line-height:1.6;text-align:center;margin-top:8px;">
         Vuoi annullare o aggiornare la carta?
@@ -181,10 +182,12 @@ def send_refresh_plan_email(
     plan_month: int,
     pdf_path: str,
     checkin_url: str = "",
+    progress_note: str = "",
 ) -> str:
     """
-    Invia il piano mensile aggiornato ai subscriber Piano Completo / Coach.
-    Usato dal cron scheduler — non dal flusso iniziale.
+    Invia il piano mensile aggiornato ai subscriber Piano Completo / Coach,
+    DOPO che hanno completato il check-in. `progress_note` (opzionale) è la riga
+    personale sul progresso del mese (es. "Complimenti, hai perso 2 kg!").
     Ritorna l'id Resend.
     """
     pdf_bytes = Path(pdf_path).read_bytes()
@@ -196,8 +199,95 @@ def send_refresh_plan_email(
         "from": settings.from_email,
         "to": [email],
         "subject": f"Il tuo piano del mese {plan_month} è pronto, {first_name} 🌿",
-        "html": _refresh_email_html(first_name, plan, plan_month, checkin_url),
+        "html": _refresh_email_html(first_name, plan, plan_month, checkin_url, progress_note),
         "attachments": [{"filename": pdf_filename, "content": pdf_b64}],
+    })
+    return response["id"]
+
+
+def _checkin_request_html(first_name: str, plan_month: int, checkin_url: str,
+                          is_reminder: bool = False) -> str:
+    """Email che invita al check-in mensile. Stessa shell brandizzata."""
+    eyebrow = "Promemoria check-in" if is_reminder else "È ora del check-in"
+    if is_reminder:
+        intro = (
+            f"Ti avevamo scritto qualche giorno fa: il piano del tuo "
+            f"<strong>{plan_month}° mese</strong> è pronto per essere generato, "
+            f"ma ci serve un aggiornamento al volo sul tuo peso attuale."
+        )
+    else:
+        intro = (
+            f"Il tuo abbonamento si è rinnovato — grazie! Prima di costruire il piano "
+            f"del tuo <strong>{plan_month}° mese</strong>, facci sapere come stai andando: "
+            f"bastano 10 secondi e il peso di oggi."
+        )
+    return f"""\
+<!DOCTYPE html>
+<html lang="it">
+<head><meta charset="UTF-8"></head>
+<body style="font-family:-apple-system,Segoe UI,Inter,sans-serif;background:#FBF9F4;margin:0;padding:24px;color:#2A2A2A;">
+  <div style="max-width:560px;margin:0 auto;background:white;border-radius:12px;overflow:hidden;border:1px solid #E5E0D3;">
+    <div style="background:#2D5F3F;padding:6px 0;"></div>
+    <div style="padding:32px 36px 28px;">
+      <div style="font-family:Georgia,serif;font-size:22px;font-weight:700;color:#2D5F3F;margin-bottom:6px;">
+        Nutri<span style="color:#C9A66B;">Scienza</span>
+      </div>
+      <p style="font-size:11px;letter-spacing:1.5px;text-transform:uppercase;color:#A88349;font-weight:700;margin:24px 0 8px;">
+        {eyebrow}
+      </p>
+      <h1 style="font-family:Georgia,serif;font-size:28px;color:#2D5F3F;margin:0 0 16px;line-height:1.2;">
+        Ciao {first_name}, sblocca il tuo piano del mese.
+      </h1>
+      <p style="font-size:15px;line-height:1.6;color:#2A2A2A;">
+        {intro}
+      </p>
+      <div style="text-align:center;margin:26px 0;">
+        <a href="{checkin_url}" style="display:inline-block;background:#2D5F3F;color:white;padding:14px 32px;border-radius:8px;font-weight:700;text-decoration:none;font-size:16px;">
+          Fai il check-in →
+        </a>
+      </div>
+      <p style="font-size:14px;line-height:1.6;color:#6B6B6B;">
+        Appena lo completi, generiamo il tuo nuovo piano personalizzato e te lo inviamo
+        via email entro pochi minuti.
+      </p>
+      <p style="font-size:14px;color:#6B6B6B;line-height:1.6;">
+        Hai domande? Scrivi a
+        <a href="mailto:{settings.support_email}" style="color:#2D5F3F;">{settings.support_email}</a>.
+      </p>
+      <hr style="border:none;border-top:1px solid #E5E0D3;margin:28px 0 18px;">
+      <p style="font-size:12px;color:#6B6B6B;line-height:1.5;">
+        Ricevi questa email perché hai un abbonamento NutriScienza attivo. Il pagamento del
+        rinnovo è già stato elaborato; il check-in serve solo a personalizzare il piano.
+      </p>
+    </div>
+    <div style="background:#1A2E22;padding:18px 36px;color:rgba(255,255,255,0.7);font-size:12px;">
+      © NutriScienza · <a href="{settings.base_url}" style="color:#C9A66B;text-decoration:none;">nutriscienza.org</a>
+    </div>
+  </div>
+</body>
+</html>"""
+
+
+def send_checkin_request_email(email: str, first_name: str, plan_month: int,
+                               checkin_url: str) -> str:
+    """Inviata subito dopo il rinnovo: invita il cliente a fare il check-in."""
+    response = resend.Emails.send({
+        "from": settings.from_email,
+        "to": [email],
+        "subject": f"{first_name}, sblocca il tuo piano del mese {plan_month} 🌿",
+        "html": _checkin_request_html(first_name, plan_month, checkin_url, is_reminder=False),
+    })
+    return response["id"]
+
+
+def send_checkin_reminder_email(email: str, first_name: str, plan_month: int,
+                                checkin_url: str) -> str:
+    """Sollecito (max 3, ogni 2 giorni) se il check-in non è ancora stato fatto."""
+    response = resend.Emails.send({
+        "from": settings.from_email,
+        "to": [email],
+        "subject": f"Promemoria: il tuo piano del mese {plan_month} ti aspetta, {first_name}",
+        "html": _checkin_request_html(first_name, plan_month, checkin_url, is_reminder=True),
     })
     return response["id"]
 

@@ -274,11 +274,15 @@ class _Doc(BaseDocTemplate):
 # ---------- API pubblica ----------
 
 def build_pdf(intake: IntakeRequest, targets: NutritionTargets, plan: MealPlan,
-              output_path: str, workout: WorkoutPlan | None = None) -> str:
+              output_path: str, workout: WorkoutPlan | None = None,
+              progress_note: str | None = None) -> str:
     """Genera il PDF e lo salva su `output_path`. Ritorna il path.
 
     `workout` è opzionale: se fornito (Completo/Coach), viene aggiunta la sezione
     «Programma di allenamento» dopo i menù e prima delle note metodologiche del piano.
+
+    `progress_note` è opzionale: se presente (piani mensili dopo il check-in), viene
+    mostrato in evidenza in cima alla pagina profilo (es. "Complimenti, hai perso 2 kg!").
     """
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     story = []
@@ -288,6 +292,12 @@ def build_pdf(intake: IntakeRequest, targets: NutritionTargets, plan: MealPlan,
     # ============ Pagina Profilo ============
     story.append(Paragraph("IL TUO PROFILO", EYEBROW))
     story.append(Paragraph("I numeri che contano per te.", H1))
+
+    # Riga personale sul progresso del mese (solo piani mensili post check-in).
+    if progress_note:
+        story.append(Spacer(1, 4))
+        story.append(_info_box("Il tuo progresso", progress_note, accent=GOLD_DARK, bg=CREAM))
+        story.append(Spacer(1, 12))
     story.append(Paragraph(
         f"Abbiamo calcolato il tuo fabbisogno energetico utilizzando la formula di Mifflin-St Jeor — "
         f"lo standard scientifico più validato — applicando un fattore di attività "

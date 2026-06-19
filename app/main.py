@@ -223,23 +223,26 @@ async def stripe_webhook(
 
     elif event["type"] == "invoice.payment_succeeded":
         # Stripe fires this on every successful subscription renewal.
-        # Questo è il percorso PRIMARIO di consegna del piano del nuovo mese:
-        # il cliente ha appena pagato → generiamo e inviamo subito, in-process
-        # (stesso DB del web service). Lo sweep giornaliero resta come backstop.
+        # Percorso PRIMARIO del rinnovo: il pagamento è già avvenuto, ma NON
+        # generiamo subito il piano. Apriamo un ciclo di check-in e invitiamo il
+        # cliente ad aggiornare i dati; il piano viene generato quando completa il
+        # check-in (vedi POST /api/checkin). Lo sweep giornaliero invia i solleciti
+        # e fa da backstop se questo webhook si perde.
         invoice: dict[str, Any] = event["data"]["object"]
         sub_id = invoice.get("subscription")
         invoice_id = invoice.get("id")
         if sub_id:
             # billing_reason == 'subscription_create' means first payment — already
-            # handled by checkout.session.completed, so skip to avoid double-generating.
+            # handled by checkout.session.completed (piano mese 1 dal questionario),
+            # quindi nessun check-in per il primo mese.
             if invoice.get("billing_reason") != "subscription_create":
                 storage.set_subscriber_status(sub_id, "active")
-                log.info("Rinnovo confermato per subscription %s (inv=%s) — genero il piano",
+                log.info("Rinnovo confermato per subscription %s (inv=%s) — richiedo il check-in",
                          sub_id, invoice_id)
-                # Lavoro pesante (Claude + PDF + email) in background: Stripe vuole <5s.
-                # refresh_by_stripe_subscription è idempotente sull'invoice_id.
+                # Apertura ciclo + email richiesta check-in in background (<5s a Stripe).
+                # request_checkin_by_stripe_subscription è idempotente sull'invoice_id.
                 background_tasks.add_task(
-                    scheduler.refresh_by_stripe_subscription, sub_id, invoice_id
+                    scheduler.request_checkin_by_stripe_subscription, sub_id, invoice_id
                 )
 
         # ── Commissione affiliato (subscription) ──────────────────────────
@@ -341,23 +344,61 @@ def checkin_get(token: str):
         raise HTTPException(status_code=404, detail="Link non valido o abbonamento cancellato")
     import json as _json
     intake_data = _json.loads(row["intake_json"])
+    awaiting = bool(row["checkin_due"])
+    # Mese del piano che verrà sbloccato dal check-in (se un ciclo è aperto).
+    pending_month = row["pending_plan_month"] or (row["plan_month"] + 1)
     return {
         "first_name": row["first_name"],
         "current_weight": intake_data.get("weight"),
         "plan": row["plan"],
         "plan_month": row["plan_month"],
+        # True = il cliente ha pagato il rinnovo e il piano è in attesa del check-in.
+        "awaiting_checkin": awaiting,
+        "pending_plan_month": pending_month,
     }
 
 
 @app.post("/api/checkin/{token}")
-def checkin_post(token: str, body: CheckinPayload):
-    """Aggiorna il peso corrente del subscriber. Il token è monouso."""
+def checkin_post(token: str, body: CheckinPayload, background_tasks: BackgroundTasks):
+    """
+    Applica il check-in mensile. Il token è monouso.
+
+    Se era in attesa un ciclo di check-in (rinnovo pagato), questa è la chiamata
+    che SBLOCCA la generazione del piano: la avviamo in background con la riga
+    personale di progresso. Altrimenti aggiorniamo solo il peso per il futuro.
+    """
     if body.weight < 30 or body.weight > 300:
         raise HTTPException(status_code=422, detail="Peso non valido (30–300 kg)")
-    ok = storage.update_subscriber_weight(token, body.weight)
-    if not ok:
+
+    ctx = storage.apply_checkin(token, body.weight)
+    if ctx is None:
         raise HTTPException(status_code=404, detail="Link non valido o già utilizzato")
-    return {"success": True, "message": "Peso aggiornato. Il prossimo piano userà il nuovo valore."}
+
+    if ctx["was_due"]:
+        note = scheduler.compute_progress_note(
+            ctx["old_weight"], ctx["new_weight"], ctx["goal"]
+        )
+        # Generazione pesante (Claude + PDF + email) in background.
+        background_tasks.add_task(
+            scheduler.refresh_subscriber,
+            ctx["sub_id"],
+            force=True,
+            invoice_id=ctx["checkin_invoice_id"],
+            reason="checkin",
+            progress_note=note,
+        )
+        return {
+            "success": True,
+            "plan_pending": True,
+            "message": "Grazie per il check-in! Stiamo generando il tuo nuovo piano — "
+                       "arriva via email tra pochi minuti.",
+        }
+
+    return {
+        "success": True,
+        "plan_pending": False,
+        "message": "Peso aggiornato. Il prossimo piano userà il nuovo valore.",
+    }
 
 
 # ---------- Billing Portal (self-service cancellation) ----------

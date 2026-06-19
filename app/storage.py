@@ -125,6 +125,20 @@ def init_db() -> None:
             "ALTER TABLE subscribers ADD COLUMN affiliate_ref TEXT",
             # Idempotenza rinnovi: ultimo invoice Stripe già fulfillato per il subscriber.
             "ALTER TABLE subscribers ADD COLUMN last_invoice_id TEXT",
+            # ── Check-in gating (il piano del mese si genera SOLO dopo il check-in) ──
+            # checkin_due=1 → il cliente ha pagato il rinnovo ma non ha ancora fatto
+            # il check-in; il piano è in attesa. Tornerà a 0 appena il cliente invia.
+            "ALTER TABLE subscribers ADD COLUMN checkin_due INTEGER NOT NULL DEFAULT 0",
+            # Invoice Stripe che ha aperto il ciclo di check-in corrente (idempotenza).
+            "ALTER TABLE subscribers ADD COLUMN checkin_invoice_id TEXT",
+            # Quando è stato richiesto il check-in (base per il timing dei solleciti).
+            "ALTER TABLE subscribers ADD COLUMN checkin_requested_at TEXT",
+            # Quanti solleciti sono stati inviati per il ciclo corrente (cap a 3).
+            "ALTER TABLE subscribers ADD COLUMN checkin_reminders_sent INTEGER NOT NULL DEFAULT 0",
+            # Timestamp dell'ultimo sollecito inviato (cadenza: ogni 2 giorni).
+            "ALTER TABLE subscribers ADD COLUMN last_reminder_at TEXT",
+            # Mese del piano da consegnare una volta completato il check-in.
+            "ALTER TABLE subscribers ADD COLUMN pending_plan_month INTEGER",
         ]:
             try:
                 c.execute(_migration)
@@ -381,6 +395,10 @@ def update_subscriber_weight(token: str, new_weight_kg: float) -> bool:
     Aggiorna il peso corrente nell'intake_json del subscriber.
     Rigenera anche un nuovo checkin_token così il link è monouso.
     Ritorna True se l'aggiornamento ha trovato un record.
+
+    NOTA: percorso legacy. Il flusso attuale usa `apply_checkin`, che oltre
+    ad aggiornare il peso chiude il ciclo di check-in e sblocca la generazione
+    del piano. Mantenuto per retro-compatibilità.
     """
     row = get_subscriber_by_checkin_token(token)
     if not row:
@@ -394,6 +412,128 @@ def update_subscriber_weight(token: str, new_weight_kg: float) -> bool:
             (json.dumps(intake_data), new_token, token),
         )
     return True
+
+
+def apply_checkin(token: str, new_weight_kg: float) -> Optional[dict]:
+    """
+    Applica il check-in mensile: aggiorna il peso, ruota il token (monouso) e,
+    se era in attesa un ciclo di check-in (cliente ha pagato il rinnovo),
+    lo CHIUDE (checkin_due=0) così non riceve più solleciti.
+
+    Ritorna un dizionario di contesto per il chiamante (endpoint), oppure None
+    se il token non è valido / l'abbonamento non è attivo:
+        {
+          "sub_id", "old_weight", "new_weight", "first_name", "email",
+          "plan", "goal", "was_due" (bool), "checkin_invoice_id",
+          "pending_plan_month" (int)
+        }
+    Se `was_due` è True, il chiamante deve avviare la generazione del piano.
+    """
+    row = get_subscriber_by_checkin_token(token)
+    if not row:
+        return None
+    intake_data = json.loads(row["intake_json"])
+    old_weight = intake_data.get("weight")
+    intake_data["weight"] = new_weight_kg
+    new_token = secrets.token_urlsafe(32)
+    was_due = bool(row["checkin_due"])
+    pending_month = row["pending_plan_month"] or (row["plan_month"] + 1)
+
+    with _conn() as c:
+        if was_due:
+            # Cliente ha agito → chiudi il ciclo e azzera i solleciti.
+            c.execute(
+                """UPDATE subscribers
+                   SET intake_json=?, checkin_token=?, checkin_due=0,
+                       checkin_reminders_sent=0
+                   WHERE id=?""",
+                (json.dumps(intake_data), new_token, row["id"]),
+            )
+        else:
+            c.execute(
+                "UPDATE subscribers SET intake_json=?, checkin_token=? WHERE id=?",
+                (json.dumps(intake_data), new_token, row["id"]),
+            )
+
+    return {
+        "sub_id": row["id"],
+        "old_weight": old_weight,
+        "new_weight": new_weight_kg,
+        "first_name": row["first_name"],
+        "email": row["email"],
+        "plan": row["plan"],
+        "goal": intake_data.get("goal"),
+        "was_due": was_due,
+        "checkin_invoice_id": row["checkin_invoice_id"],
+        "pending_plan_month": pending_month,
+    }
+
+
+def open_checkin_cycle(sub_id: str, plan_month: int, invoice_id: str | None = None) -> str:
+    """
+    Apre un ciclo di check-in per il subscriber: il cliente ha pagato il rinnovo
+    (o lo sweep di backstop ha rilevato un rinnovo previsto) ma deve fare il
+    check-in prima di ricevere il piano del mese.
+
+    Idempotente:
+      - stesso invoice che ha già aperto il ciclo corrente → 'skipped:duplicate'
+      - stesso invoice già consegnato in passato            → 'skipped:already_delivered'
+      - backstop (invoice_id=None) ma c'è già un ciclo aperto → 'skipped:already_open'
+
+    Ritorna: 'opened' | 'skipped:not_found' | 'skipped:duplicate'
+             | 'skipped:already_delivered' | 'skipped:already_open'
+    """
+    row = get_subscriber_by_id(sub_id)
+    if row is None:
+        return "skipped:not_found"
+    if invoice_id and row["checkin_invoice_id"] == invoice_id and row["checkin_due"]:
+        return "skipped:duplicate"
+    if invoice_id and row["last_invoice_id"] == invoice_id:
+        return "skipped:already_delivered"
+    if invoice_id is None and row["checkin_due"]:
+        return "skipped:already_open"
+
+    with _conn() as c:
+        c.execute(
+            """UPDATE subscribers
+               SET checkin_due=1, checkin_invoice_id=?, checkin_requested_at=?,
+                   checkin_reminders_sent=0, last_reminder_at=NULL,
+                   pending_plan_month=?
+               WHERE id=?""",
+            (invoice_id, _now_iso(), plan_month, sub_id),
+        )
+    return "opened"
+
+
+def get_subscribers_awaiting_checkin() -> list[sqlite3.Row]:
+    """Subscriber attivi con un ciclo di check-in aperto (per i solleciti)."""
+    with _conn() as c:
+        return c.execute(
+            """SELECT * FROM subscribers
+               WHERE subscription_status='active' AND checkin_due=1
+               ORDER BY checkin_requested_at ASC""",
+        ).fetchall()
+
+
+def record_checkin_reminder(sub_id: str) -> None:
+    """Incrementa il contatore dei solleciti e registra il timestamp."""
+    with _conn() as c:
+        c.execute(
+            """UPDATE subscribers
+               SET checkin_reminders_sent = checkin_reminders_sent + 1,
+                   last_reminder_at = ?
+               WHERE id=?""",
+            (_now_iso(), sub_id),
+        )
+
+
+def close_checkin_cycle(sub_id: str) -> None:
+    """Chiude esplicitamente un ciclo di check-in (usato come rete di sicurezza)."""
+    with _conn() as c:
+        c.execute(
+            "UPDATE subscribers SET checkin_due=0 WHERE id=?",
+            (sub_id,),
+        )
 
 
 # ── Admin ─────────────────────────────────────────────────────────────────────
