@@ -155,6 +155,16 @@ def init_db() -> None:
             "ALTER TABLE subscribers ADD COLUMN last_reminder_at TEXT",
             # Mese del piano da consegnare una volta completato il check-in.
             "ALTER TABLE subscribers ADD COLUMN pending_plan_month INTEGER",
+            # ── Traffic attribution (sorgenti per decidere dove investire in promo) ──
+            # Catturati al submit del questionario (first-touch da localStorage).
+            "ALTER TABLE orders ADD COLUMN utm_source TEXT",
+            "ALTER TABLE orders ADD COLUMN utm_medium TEXT",
+            "ALTER TABLE orders ADD COLUMN utm_campaign TEXT",
+            "ALTER TABLE orders ADD COLUMN referrer TEXT",
+            "ALTER TABLE orders ADD COLUMN landing_page TEXT",
+            # ── GDPR ──
+            # Marca le righe il cui PII è stato cancellato/anonimizzato su richiesta.
+            "ALTER TABLE orders ADD COLUMN anonymized_at TEXT",
         ]:
             try:
                 c.execute(_migration)
@@ -174,13 +184,21 @@ def _conn():
         conn.close()
 
 
-def create_order(intake: IntakeRequest, targets: NutritionTargets, affiliate_ref: str | None = None) -> str:
+def create_order(
+    intake: IntakeRequest,
+    targets: NutritionTargets,
+    affiliate_ref: str | None = None,
+    traffic: dict | None = None,
+) -> str:
     order_id = "ord_" + uuid.uuid4().hex[:16]
+    traffic = traffic or {}
     with _conn() as c:
         c.execute(
             """INSERT INTO orders (id, intake_json, targets_json, plan_chosen, email,
-                                   status, affiliate_ref, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, 'pending_payment', ?, ?, ?)""",
+                                   status, affiliate_ref,
+                                   utm_source, utm_medium, utm_campaign, referrer, landing_page,
+                                   created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, 'pending_payment', ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 order_id,
                 intake.model_dump_json(by_alias=True),
@@ -188,6 +206,11 @@ def create_order(intake: IntakeRequest, targets: NutritionTargets, affiliate_ref
                 intake.plan,
                 intake.email,
                 affiliate_ref,
+                traffic.get("utm_source"),
+                traffic.get("utm_medium"),
+                traffic.get("utm_campaign"),
+                traffic.get("referrer"),
+                traffic.get("landing_page"),
                 _now_iso(),
                 _now_iso(),
             ),
@@ -989,3 +1012,344 @@ def list_payouts_for_affiliate(affiliate_id: str) -> list[sqlite3.Row]:
                ORDER BY paid_at DESC""",
             (affiliate_id,),
         ).fetchall()
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Admin: cancellazioni (ordini / affiliati)
+# ════════════════════════════════════════════════════════════════════════════
+
+PAID_STATUSES = ("paid", "generating", "sent")
+
+
+def delete_order(order_id: str) -> Optional[dict]:
+    """
+    Hard-delete di un ordine (per ripulire test / ordini falliti).
+    Ritorna {'pdf_path', 'email', 'status'} così il chiamante può rimuovere
+    anche il PDF dal disco, oppure None se l'ordine non esiste.
+    """
+    with _conn() as c:
+        row = c.execute(
+            "SELECT pdf_path, email, status FROM orders WHERE id=?", (order_id,)
+        ).fetchone()
+        if not row:
+            return None
+        c.execute("DELETE FROM orders WHERE id=?", (order_id,))
+    return {"pdf_path": row["pdf_path"], "email": row["email"], "status": row["status"]}
+
+
+def delete_affiliate(affiliate_id: str) -> Optional[dict]:
+    """
+    Hard-delete di un affiliato + cascata su commissioni e payout collegati.
+    Pensato per rimuovere affiliati di test. Ritorna un riassunto di quante righe
+    sono state rimosse, o None se l'affiliato non esiste.
+
+    ATTENZIONE: distrugge anche lo storico commissioni/payout di quell'affiliato.
+    Per i payout già eseguiti questo cancella solo il record interno, NON storna
+    bonifici reali.
+    """
+    with _conn() as c:
+        row = c.execute("SELECT id, name FROM affiliates WHERE id=?", (affiliate_id,)).fetchone()
+        if not row:
+            return None
+        com = c.execute("DELETE FROM commissions WHERE affiliate_id=?", (affiliate_id,))
+        com_n = com.rowcount
+        pay = c.execute("DELETE FROM payouts WHERE affiliate_id=?", (affiliate_id,))
+        pay_n = pay.rowcount
+        c.execute("DELETE FROM affiliates WHERE id=?", (affiliate_id,))
+    return {"name": row["name"], "commissions_deleted": com_n, "payouts_deleted": pay_n}
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Admin: profilo cliente (aggregato per email — copre ordini + subscriber)
+# ════════════════════════════════════════════════════════════════════════════
+
+def list_customers(search: Optional[str] = None) -> list[dict]:
+    """
+    Elenco clienti unici (chiave = email, case-insensitive) con aggregati per la
+    tabella admin. Aggrega ordini e subscriber. Il calcolo monetario esatto è nel
+    profilo dettagliato; qui esponiamo i conteggi e i piani pagati.
+    """
+    with _conn() as c:
+        orders = c.execute(
+            """SELECT id, email, plan_chosen, status, created_at, updated_at, intake_json
+               FROM orders ORDER BY created_at DESC"""
+        ).fetchall()
+        subs = c.execute(
+            """SELECT email, first_name, plan, subscription_status, next_plan_due_at
+               FROM subscribers"""
+        ).fetchall()
+
+    cust: dict[str, dict] = {}
+
+    def _bucket(email: str) -> dict:
+        key = (email or "").lower()
+        if key not in cust:
+            cust[key] = {
+                "email": email,
+                "first_name": None,
+                "orders_count": 0,
+                "paid_count": 0,
+                "paid_plans": [],
+                "plans": set(),
+                "has_subscriber": False,
+                "subscription_status": None,
+                "last_activity": None,
+            }
+        return cust[key]
+
+    for o in orders:
+        b = _bucket(o["email"])
+        b["orders_count"] += 1
+        b["plans"].add(o["plan_chosen"])
+        if not b["first_name"]:
+            try:
+                b["first_name"] = json.loads(o["intake_json"]).get("firstName")
+            except Exception:
+                pass
+        if o["status"] in PAID_STATUSES:
+            b["paid_count"] += 1
+            b["paid_plans"].append(o["plan_chosen"])
+        ts = o["updated_at"] or o["created_at"]
+        if ts and (b["last_activity"] is None or ts > b["last_activity"]):
+            b["last_activity"] = ts
+
+    for s in subs:
+        b = _bucket(s["email"])
+        b["has_subscriber"] = True
+        # Stato "migliore": active prevale su cancelled/past_due nella vista lista.
+        if b["subscription_status"] in (None, "cancelled"):
+            b["subscription_status"] = s["subscription_status"]
+        if not b["first_name"] and s["first_name"]:
+            b["first_name"] = s["first_name"]
+        b["plans"].add(s["plan"])
+
+    out = []
+    for b in cust.values():
+        b["plans"] = sorted(b["plans"])
+        out.append(b)
+
+    if search:
+        q = search.lower().strip()
+        out = [b for b in out
+               if q in (b["email"] or "").lower()
+               or q in (b["first_name"] or "").lower()]
+
+    out.sort(key=lambda b: b["last_activity"] or "", reverse=True)
+    return out
+
+
+def get_customer_orders(email: str) -> list[sqlite3.Row]:
+    with _conn() as c:
+        return c.execute(
+            """SELECT id, plan_chosen, email, status, stripe_subscription_id,
+                      stripe_customer_id, pdf_path, error, affiliate_ref,
+                      utm_source, utm_medium, utm_campaign, referrer, landing_page,
+                      intake_json, targets_json, created_at, updated_at, anonymized_at
+               FROM orders WHERE LOWER(email)=? ORDER BY created_at DESC""",
+            (email.lower(),),
+        ).fetchall()
+
+
+def get_customer_subscribers(email: str) -> list[sqlite3.Row]:
+    with _conn() as c:
+        return c.execute(
+            "SELECT * FROM subscribers WHERE LOWER(email)=? ORDER BY created_at DESC",
+            (email.lower(),),
+        ).fetchall()
+
+
+def get_renewals_for_subscriptions(sub_ids: list[str]) -> list[sqlite3.Row]:
+    if not sub_ids:
+        return []
+    placeholders = ",".join("?" for _ in sub_ids)
+    with _conn() as c:
+        return c.execute(
+            f"""SELECT stripe_invoice_id, stripe_subscription_id, plan, amount_cents,
+                       currency, created_at
+                FROM renewals WHERE stripe_subscription_id IN ({placeholders})
+                ORDER BY created_at DESC""",
+            tuple(sub_ids),
+        ).fetchall()
+
+
+def update_intake_fields(scope: str, record_id: str, fields: dict) -> bool:
+    """
+    Aggiornamento manuale dei dati cliente. `scope` ∈ {'order','subscriber'}.
+    Fa merge di `fields` dentro intake_json. Se vengono passati 'email' o
+    'firstName'/'first_name' sincronizza anche le colonne dedicate.
+    Ritorna False se il record non esiste.
+    """
+    table = "orders" if scope == "order" else "subscribers"
+    with _conn() as c:
+        row = c.execute(f"SELECT * FROM {table} WHERE id=?", (record_id,)).fetchone()
+        if not row:
+            return False
+        intake = json.loads(row["intake_json"])
+        for k, v in fields.items():
+            intake[k] = v
+        # Sincronizza colonne dedicate.
+        new_email = fields.get("email")
+        new_first = fields.get("firstName") or fields.get("first_name")
+        sets = ["intake_json=?"]
+        args: list = [json.dumps(intake)]
+        if new_email is not None:
+            sets.append("email=?")
+            args.append(new_email)
+        if scope == "subscriber" and new_first is not None:
+            sets.append("first_name=?")
+            args.append(new_first)
+        if scope == "order":
+            sets.append("updated_at=?")
+            args.append(_now_iso())
+        args.append(record_id)
+        c.execute(f"UPDATE {table} SET {', '.join(sets)} WHERE id=?", tuple(args))
+    return True
+
+
+# ── GDPR: cancellazione dati cliente ─────────────────────────────────────────
+
+def _anonymized_intake(raw_json: str) -> str:
+    """Rimpiazza gli identificatori diretti e i dati sanitari con placeholder
+    validi, mantenendo uno schema IntakeRequest valido (serve per i record paid
+    che restano per la contabilità)."""
+    try:
+        d = json.loads(raw_json)
+    except Exception:
+        d = {}
+    d["firstName"] = "(rimosso)"
+    d["email"] = "deleted@gdpr.local"
+    d["age"] = 18
+    d["height"] = 170
+    d["weight"] = 70.0
+    d["targetWeight"] = None
+    d["allergies"] = []
+    d["dislikes"] = None
+    d["affiliateRef"] = None
+    return json.dumps(d)
+
+
+def gdpr_delete_customer(email: str) -> dict:
+    """
+    Cancellazione GDPR. Strategia (scelta operativa):
+      - Ordini PAGATI (paid/generating/sent): anonimizzati — PII e dati sanitari
+        rimossi, ma importo/piano/date conservati per obblighi contabili e per la
+        riconciliazione con Stripe.
+      - Ordini NON pagati (test/abbandonati): hard-delete.
+      - Subscriber: PII anonimizzata; stripe_ids mantenuti per la fatturazione.
+    Ritorna un riassunto + lista pdf_path da rimuovere dal disco.
+    """
+    em = email.lower()
+    now = _now_iso()
+    anonymized = 0
+    deleted = 0
+    pdf_paths: list[str] = []
+    active_subs = 0
+    with _conn() as c:
+        orders = c.execute(
+            "SELECT id, status, pdf_path, intake_json FROM orders WHERE LOWER(email)=?",
+            (em,),
+        ).fetchall()
+        for o in orders:
+            if o["pdf_path"]:
+                pdf_paths.append(o["pdf_path"])
+            if o["status"] in PAID_STATUSES:
+                c.execute(
+                    """UPDATE orders
+                       SET email='deleted@gdpr.local', intake_json=?, error=NULL,
+                           pdf_path=NULL, anonymized_at=?, updated_at=?
+                       WHERE id=?""",
+                    (_anonymized_intake(o["intake_json"]), now, now, o["id"]),
+                )
+                anonymized += 1
+            else:
+                c.execute("DELETE FROM orders WHERE id=?", (o["id"],))
+                deleted += 1
+
+        subs = c.execute(
+            "SELECT id, subscription_status, intake_json FROM subscribers WHERE LOWER(email)=?",
+            (em,),
+        ).fetchall()
+        for s in subs:
+            if s["subscription_status"] == "active":
+                active_subs += 1
+            c.execute(
+                """UPDATE subscribers
+                   SET email='deleted@gdpr.local', first_name='(rimosso)', intake_json=?
+                   WHERE id=?""",
+                (_anonymized_intake(s["intake_json"]), s["id"]),
+            )
+            anonymized += 1
+    return {
+        "orders_anonymized": anonymized,
+        "orders_deleted": deleted,
+        "active_subscribers": active_subs,
+        "pdf_paths": pdf_paths,
+    }
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Admin: traffico e sorgenti (per decidere dove investire in promo)
+# ════════════════════════════════════════════════════════════════════════════
+
+# Prezzi in centesimi per la stima ricavi-per-sorgente direttamente in SQL.
+_REVENUE_CASE = (
+    "CASE plan_chosen WHEN 'base' THEN 1900 "
+    "WHEN 'completo' THEN 2900 WHEN 'coach' THEN 9900 ELSE 0 END"
+)
+_PAID_IN = "('paid','generating','sent')"
+
+
+def traffic_by_source() -> list[sqlite3.Row]:
+    """
+    Aggregato per sorgente/medium/campagna: visite-form (signups), conversioni
+    pagate e ricavo di acquisizione (primo pagamento). I rinnovi ricorrenti non
+    sono inclusi qui — questa è la metrica di ACQUISIZIONE, quella che conta per
+    decidere la spesa pubblicitaria.
+    """
+    with _conn() as c:
+        return c.execute(
+            f"""SELECT
+                  COALESCE(NULLIF(utm_source,''), 'diretto/organico') AS source,
+                  COALESCE(NULLIF(utm_medium,''), '(nessuno)')        AS medium,
+                  COALESCE(NULLIF(utm_campaign,''), '(nessuna)')      AS campaign,
+                  COUNT(*) AS signups,
+                  SUM(CASE WHEN status IN {_PAID_IN} THEN 1 ELSE 0 END) AS paid,
+                  SUM(CASE WHEN status IN {_PAID_IN} THEN {_REVENUE_CASE} ELSE 0 END) AS revenue_cents
+                FROM orders
+                GROUP BY source, medium, campaign
+                ORDER BY revenue_cents DESC, signups DESC"""
+        ).fetchall()
+
+
+def traffic_by_referrer() -> list[sqlite3.Row]:
+    """Rollup dei referrer per il traffico SENZA utm_source (organico/diretto):
+    aiuta a vedere quali siti esterni portano clienti senza tag campagna."""
+    with _conn() as c:
+        return c.execute(
+            f"""SELECT
+                  COALESCE(NULLIF(referrer,''), '(diretto)') AS referrer,
+                  COUNT(*) AS signups,
+                  SUM(CASE WHEN status IN {_PAID_IN} THEN 1 ELSE 0 END) AS paid,
+                  SUM(CASE WHEN status IN {_PAID_IN} THEN {_REVENUE_CASE} ELSE 0 END) AS revenue_cents
+                FROM orders
+                WHERE utm_source IS NULL OR utm_source=''
+                GROUP BY referrer
+                ORDER BY revenue_cents DESC, signups DESC"""
+        ).fetchall()
+
+
+def traffic_totals() -> dict:
+    """Totali complessivi per le KPI in cima al tab Traffico."""
+    with _conn() as c:
+        row = c.execute(
+            f"""SELECT
+                  COUNT(*) AS signups,
+                  SUM(CASE WHEN status IN {_PAID_IN} THEN 1 ELSE 0 END) AS paid,
+                  SUM(CASE WHEN status IN {_PAID_IN} THEN {_REVENUE_CASE} ELSE 0 END) AS revenue_cents
+                FROM orders"""
+        ).fetchone()
+    return {
+        "signups": row["signups"] or 0,
+        "paid": row["paid"] or 0,
+        "revenue_cents": row["revenue_cents"] or 0,
+    }

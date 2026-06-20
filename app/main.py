@@ -91,8 +91,14 @@ app.add_middleware(
 @app.on_event("startup")
 def on_startup():
     storage.init_db()
-    Path("./data/pdfs").mkdir(parents=True, exist_ok=True)
-    log.info("NutriScienza backend avviato (env=%s)", settings.environment)
+    # IMPORTANTE: usa il path configurato (disco persistente in prod), NON un
+    # path relativo hardcoded. Su Render il filesystem è effimero: senza disco
+    # montato su questo path i PDF spariscono ad ogni redeploy (vedi DEPLOY.md).
+    Path(settings.pdf_storage_dir).mkdir(parents=True, exist_ok=True)
+    log.info(
+        "NutriScienza backend avviato (env=%s, db=%s, pdf_dir=%s)",
+        settings.environment, settings.database_path, settings.pdf_storage_dir,
+    )
 
 
 # ---------- Health ----------
@@ -121,7 +127,14 @@ def intake(request: Request, payload: IntakeRequest):
     except Exception:
         log.exception("Errore validazione affiliate_ref — ignorato")
 
-    order_id = storage.create_order(payload, targets, affiliate_ref=validated_ref)
+    traffic = {
+        "utm_source": payload.utm_source,
+        "utm_medium": payload.utm_medium,
+        "utm_campaign": payload.utm_campaign,
+        "referrer": payload.referrer,
+        "landing_page": payload.landing_page,
+    }
+    order_id = storage.create_order(payload, targets, affiliate_ref=validated_ref, traffic=traffic)
 
     try:
         session = create_checkout_session(
@@ -714,6 +727,252 @@ def admin_download_pdf(order_id: str):
     )
 
 
+@app.delete("/api/admin/orders/{order_id}", dependencies=[Depends(require_admin)])
+def admin_delete_order(order_id: str):
+    """
+    Hard-delete di un ordine (ripulisce test / ordini falliti). Rimuove anche il
+    PDF dal disco se presente. Operazione irreversibile.
+    """
+    result = storage.delete_order(order_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Ordine non trovato")
+    if result.get("pdf_path"):
+        try:
+            Path(result["pdf_path"]).unlink(missing_ok=True)
+        except Exception:
+            log.exception("Rimozione PDF fallita per ordine %s", order_id)
+    return {"deleted": True, "order_id": order_id}
+
+
+# ---------- Admin: clienti (profilo aggregato per email) ----------
+
+class CustomerFieldUpdate(BaseModel):
+    scope: str           # 'order' | 'subscriber'
+    record_id: str
+    fields: dict
+
+
+@app.get("/api/admin/customers", dependencies=[Depends(require_admin)])
+def admin_list_customers(search: str | None = None):
+    rows = storage.list_customers(search=search)
+    out = []
+    for b in rows:
+        spent = sum(PLAN_PRICE_CENTS.get(p, 0) for p in b["paid_plans"])
+        out.append({
+            "email": b["email"],
+            "first_name": b["first_name"],
+            "orders_count": b["orders_count"],
+            "paid_count": b["paid_count"],
+            "plans": b["plans"],
+            "has_subscriber": b["has_subscriber"],
+            "subscription_status": b["subscription_status"],
+            "acquisition_spent_cents": spent,
+            "last_activity": b["last_activity"],
+        })
+    return out
+
+
+@app.get("/api/admin/customers/{email}", dependencies=[Depends(require_admin)])
+def admin_customer_profile(email: str):
+    import json as _json
+    orders = storage.get_customer_orders(email)
+    subs = storage.get_customer_subscribers(email)
+    if not orders and not subs:
+        raise HTTPException(status_code=404, detail="Cliente non trovato")
+
+    sub_ids = [s["stripe_subscription_id"] for s in subs if s["stripe_subscription_id"]]
+    renewals = storage.get_renewals_for_subscriptions(sub_ids)
+
+    # ── Anagrafica + dati antropometrici ──
+    # Preferiamo l'intake del subscriber (è il record che guida la generazione del
+    # piano e il bersaglio dell'edit manuale), così vista e modifica coincidono.
+    profile: dict | None = None
+    first_name = None
+    if subs:
+        try:
+            profile = _json.loads(subs[0]["intake_json"])
+            first_name = profile.get("firstName")
+        except Exception:
+            profile = None
+    if profile is None:
+        for o in orders:
+            try:
+                profile = _json.loads(o["intake_json"])
+                first_name = profile.get("firstName")
+                break
+            except Exception:
+                continue
+    if profile is None:
+        profile = {}
+
+    # ── Pagamenti (acquisizione + rinnovi) ──
+    payments = []
+    total_paid = 0
+    for o in orders:
+        if o["status"] in ("paid", "generating", "sent"):
+            amt = PLAN_PRICE_CENTS.get(o["plan_chosen"], 0)
+            total_paid += amt
+            payments.append({
+                "type": "ordine",
+                "plan": o["plan_chosen"],
+                "amount_cents": amt,
+                "date": o["updated_at"],
+                "ref": o["id"],
+            })
+    for r in renewals:
+        amt = int(r["amount_cents"] or 0)
+        total_paid += amt
+        payments.append({
+            "type": "rinnovo",
+            "plan": r["plan"],
+            "amount_cents": amt,
+            "date": r["created_at"],
+            "ref": r["stripe_invoice_id"],
+        })
+    payments.sort(key=lambda p: p["date"] or "", reverse=True)
+
+    # ── Piani generati (PDF disponibili + mesi consegnati) ──
+    plans = []
+    for o in orders:
+        plans.append({
+            "order_id": o["id"],
+            "plan": o["plan_chosen"],
+            "status": o["status"],
+            "pdf_available": bool(o["status"] == "sent" and o["pdf_path"]),
+            "created_at": o["created_at"],
+        })
+
+    return {
+        "email": email,
+        "first_name": first_name,
+        "profile": profile or {},
+        "orders": [{
+            "id": o["id"], "plan": o["plan_chosen"], "status": o["status"],
+            "created_at": o["created_at"], "updated_at": o["updated_at"],
+            "pdf_available": bool(o["status"] == "sent" and o["pdf_path"]),
+            "affiliate_ref": o["affiliate_ref"],
+            "utm_source": o["utm_source"], "utm_medium": o["utm_medium"],
+            "utm_campaign": o["utm_campaign"], "referrer": o["referrer"],
+            "anonymized": bool(o["anonymized_at"]),
+        } for o in orders],
+        "subscribers": [{
+            "id": s["id"], "plan": s["plan"], "status": s["subscription_status"],
+            "plan_month": s["plan_month"], "next_plan_due_at": s["next_plan_due_at"],
+            "checkin_due": bool(s["checkin_due"]) if "checkin_due" in s.keys() else False,
+            "created_at": s["created_at"], "cancelled_at": s["cancelled_at"],
+        } for s in subs],
+        "payments": payments,
+        "plans_generated": plans,
+        "totals": {
+            "paid_cents": total_paid,
+            "payments_count": len(payments),
+            "active_subscriber": any(s["subscription_status"] == "active" for s in subs),
+        },
+    }
+
+
+@app.patch("/api/admin/customers/update", dependencies=[Depends(require_admin)])
+def admin_customer_update(body: CustomerFieldUpdate):
+    """Aggiornamento manuale di campi dell'intake (anagrafica / antropometrici)."""
+    if body.scope not in ("order", "subscriber"):
+        raise HTTPException(status_code=422, detail="scope deve essere 'order' o 'subscriber'")
+    ok = storage.update_intake_fields(body.scope, body.record_id, body.fields)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Record non trovato")
+    return {"updated": True}
+
+
+@app.post("/api/admin/customers/{email}/request-update", dependencies=[Depends(require_admin)])
+def admin_customer_request_update(email: str, background_tasks: BackgroundTasks):
+    """
+    Invia la richiesta di aggiornamento mensile (check-in) a tutti gli abbonamenti
+    attivi del cliente. Il piano verrà generato quando il cliente completa il check-in.
+    """
+    subs = storage.get_customer_subscribers(email)
+    targets = [s for s in subs
+               if s["subscription_status"] == "active" and s["plan"] in ("completo", "coach")]
+    if not targets:
+        raise HTTPException(
+            status_code=400,
+            detail="Nessun abbonamento attivo (Completo/Coach) per questo cliente.",
+        )
+    for s in targets:
+        background_tasks.add_task(scheduler.request_checkin_for_subscriber, s["id"])
+    return {"queued": True, "subscribers": [s["id"] for s in targets]}
+
+
+@app.post("/api/admin/customers/{email}/force-plan", dependencies=[Depends(require_admin)])
+def admin_customer_force_plan(email: str, background_tasks: BackgroundTasks):
+    """
+    Forza la generazione del piano per il cliente:
+      - se ha un abbonamento attivo → refresh forzato (genera + invia subito);
+      - altrimenti → ri-processa l'ultimo ordine pagato (rigenera PDF + email).
+    """
+    subs = storage.get_customer_subscribers(email)
+    active = [s for s in subs if s["subscription_status"] == "active"]
+    if active:
+        for s in active:
+            background_tasks.add_task(
+                scheduler.refresh_subscriber, s["id"], force=True, reason="admin_force_customer"
+            )
+        return {"queued": True, "mode": "subscriber_refresh",
+                "subscribers": [s["id"] for s in active]}
+
+    # Nessun subscriber attivo → rigenera l'ultimo ordine pagato.
+    orders = storage.get_customer_orders(email)
+    paid = [o for o in orders if o["status"] in ("paid", "generating", "sent")]
+    if not paid:
+        raise HTTPException(status_code=400, detail="Nessun ordine pagato da rigenerare.")
+    target = paid[0]  # già ordinati per created_at DESC
+    storage.update_status(target["id"], "paid")
+    background_tasks.add_task(_run_generation_pipeline, target["id"])
+    return {"queued": True, "mode": "order_regenerate", "order_id": target["id"]}
+
+
+@app.delete("/api/admin/customers/{email}", dependencies=[Depends(require_admin)])
+def admin_customer_gdpr_delete(email: str):
+    """
+    Cancellazione GDPR. Anonimizza gli ordini pagati (conserva importi/date per la
+    contabilità), hard-delete degli ordini non pagati, anonimizza i subscriber.
+    Rimuove i PDF dal disco. Irreversibile.
+    """
+    result = storage.gdpr_delete_customer(email)
+    for p in result.get("pdf_paths", []):
+        try:
+            Path(p).unlink(missing_ok=True)
+        except Exception:
+            log.exception("Rimozione PDF GDPR fallita: %s", p)
+    return {
+        "deleted": True,
+        "orders_anonymized": result["orders_anonymized"],
+        "orders_deleted": result["orders_deleted"],
+        "active_subscribers": result["active_subscribers"],
+        "warning": ("Ci sono abbonamenti ATTIVI: annullali anche su Stripe per "
+                    "fermare la fatturazione.") if result["active_subscribers"] else None,
+    }
+
+
+# ---------- Admin: traffico e sorgenti ----------
+
+@app.get("/api/admin/traffic", dependencies=[Depends(require_admin)])
+def admin_traffic():
+    """
+    Sorgenti di traffico con conversioni e ricavo di acquisizione — per decidere
+    dove investire in promo. I rinnovi ricorrenti NON sono inclusi: questa è la
+    metrica di acquisizione (primo pagamento per sorgente).
+    """
+    by_source = [dict(r) for r in storage.traffic_by_source()]
+    by_referrer = [dict(r) for r in storage.traffic_by_referrer()]
+    totals = storage.traffic_totals()
+    for r in by_source:
+        r["conversion_pct"] = round((r["paid"] / r["signups"]) * 100, 1) if r["signups"] else 0.0
+    return {
+        "totals": totals,
+        "by_source": by_source,
+        "by_referrer": by_referrer,
+    }
+
+
 # ---------- Affiliate program ----------
 # Tutto isolato: i fallimenti qui non toccano checkout, generazione, email.
 
@@ -774,6 +1033,19 @@ def admin_update_affiliate_status(aff_id: str, status: str):
         raise HTTPException(status_code=422, detail="Status non valido")
     storage.update_affiliate_status(aff_id, status)
     return {"ok": True}
+
+
+@app.delete("/api/admin/affiliates/{aff_id}", dependencies=[Depends(require_admin)])
+def admin_delete_affiliate(aff_id: str):
+    """
+    Hard-delete di un affiliato + cascata su commissioni e payout (per rimuovere
+    affiliati di test). Irreversibile: distrugge anche lo storico interno delle
+    commissioni. Non storna bonifici reali già eseguiti.
+    """
+    result = storage.delete_affiliate(aff_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Affiliate non trovato")
+    return {"deleted": True, **result}
 
 
 @app.post("/api/admin/affiliates/{aff_id}/commission-rate", dependencies=[Depends(require_admin)])

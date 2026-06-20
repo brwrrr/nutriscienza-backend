@@ -50,6 +50,15 @@ class IntakeRequest(BaseModel):
     # in landing page e propagato al checkout. Nessun impatto se assente.
     affiliate_ref: Optional[str] = Field(default=None, alias="affiliateRef", max_length=40)
 
+    # Attribuzione traffico — opzionale. Catturati first-touch dal frontend
+    # (utm_* + referrer + landing page). Servono per capire dove investire in promo.
+    # Nessun impatto sul flusso se assenti.
+    utm_source: Optional[str] = Field(default=None, alias="utmSource", max_length=120)
+    utm_medium: Optional[str] = Field(default=None, alias="utmMedium", max_length=120)
+    utm_campaign: Optional[str] = Field(default=None, alias="utmCampaign", max_length=120)
+    referrer: Optional[str] = Field(default=None, max_length=400)
+    landing_page: Optional[str] = Field(default=None, alias="landingPage", max_length=400)
+
     model_config = {"populate_by_name": True}
 
     @field_validator("dislikes", mode="before")
