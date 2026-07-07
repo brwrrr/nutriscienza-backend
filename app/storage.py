@@ -7,7 +7,7 @@ import secrets
 import sqlite3
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -165,6 +165,11 @@ def init_db() -> None:
             # ── GDPR ──
             # Marca le righe il cui PII è stato cancellato/anonimizzato su richiesta.
             "ALTER TABLE orders ADD COLUMN anonymized_at TEXT",
+            # ── Upsell Base → Completo ──
+            # Timestamp dell'invio dell'email "il tuo piano ha una data di scadenza"
+            # (~1 mese dopo l'acquisto Base). NULL = non ancora inviata → guardia
+            # anti-doppione per lo sweep giornaliero.
+            "ALTER TABLE orders ADD COLUMN base_upsell_sent_at TEXT",
         ]:
             try:
                 c.execute(_migration)
@@ -620,6 +625,55 @@ def get_paid_orders_since(since_iso: str) -> list[sqlite3.Row]:
                ORDER BY updated_at DESC""",
             (since_iso,),
         ).fetchall()
+
+
+def get_base_orders_due_for_upsell(min_days: int, max_days: int) -> list[sqlite3.Row]:
+    """
+    Acquirenti Piano Base (una tantum) da contattare con l'upsell verso il Piano
+    Completo, ~1 mese dopo l'acquisto.
+
+    Criteri (tutti profit-safe):
+      • plan_chosen='base' e pagato ('paid'/'generating'/'sent');
+      • acquisto tra `max_days` e `min_days` giorni fa (finestra, non istante:
+        copre run del cron saltati senza mai ri-inviare);
+      • upsell non ancora inviato (base_upsell_sent_at IS NULL);
+      • email NON già abbonata attiva (non infastidiamo chi ha già fatto upgrade).
+
+    Ritorna righe con id, email, intake_json (per il nome), created_at.
+    """
+    now = datetime.now(timezone.utc)
+    newest = (now - timedelta(days=min_days)).isoformat()   # acquistato ALMENO min_days fa
+    oldest = (now - timedelta(days=max_days)).isoformat()    # ma non oltre max_days fa
+    with _conn() as c:
+        return c.execute(
+            """SELECT id, email, intake_json, created_at
+               FROM orders
+               WHERE plan_chosen = 'base'
+                 AND status IN ('paid', 'generating', 'sent')
+                 AND base_upsell_sent_at IS NULL
+                 AND created_at <= ?
+                 AND created_at >= ?
+                 AND anonymized_at IS NULL
+                 AND email NOT IN (
+                       SELECT email FROM subscribers
+                       WHERE subscription_status IN ('active', 'past_due')
+                 )
+               ORDER BY created_at ASC""",
+            (newest, oldest),
+        ).fetchall()
+
+
+def mark_base_upsell_sent(order_id: str) -> None:
+    """
+    Segna l'upsell come inviato. NON tocca updated_at di proposito: quella colonna
+    guida i calcoli di fatturato per periodo (get_paid_orders_since) e spostarla
+    farebbe riapparire un ordine vecchio nel giro d'affari "di oggi".
+    """
+    with _conn() as c:
+        c.execute(
+            "UPDATE orders SET base_upsell_sent_at=? WHERE id=?",
+            (_now_iso(), order_id),
+        )
 
 
 def count_subscribers_by_plan_active() -> dict[str, int]:
@@ -1144,7 +1198,8 @@ def get_customer_orders(email: str) -> list[sqlite3.Row]:
             """SELECT id, plan_chosen, email, status, stripe_subscription_id,
                       stripe_customer_id, pdf_path, error, affiliate_ref,
                       utm_source, utm_medium, utm_campaign, referrer, landing_page,
-                      intake_json, targets_json, created_at, updated_at, anonymized_at
+                      intake_json, targets_json, created_at, updated_at, anonymized_at,
+                      base_upsell_sent_at
                FROM orders WHERE LOWER(email)=? ORDER BY created_at DESC""",
             (email.lower(),),
         ).fetchall()

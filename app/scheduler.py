@@ -35,6 +35,7 @@ from pathlib import Path
 from .config import settings
 from .email_sender import (
     send_admin_failure,
+    send_base_upsell_email,
     send_checkin_reminder_email,
     send_checkin_request_email,
     send_refresh_plan_email,
@@ -325,14 +326,55 @@ def _open_missed_checkins() -> dict[str, int]:
     return counts
 
 
+def _send_base_upsells() -> dict[str, int]:
+    """
+    Invia l'email di upsell Base → Completo agli acquirenti del Piano Base a ~1 mese
+    dall'acquisto (finestra configurabile, default 30–45 giorni). Idempotente: ogni
+    ordine viene marcato dopo l'invio, così non viene mai ricontattato due volte.
+
+    Best-effort: un fallimento su un singolo ordine non blocca gli altri né il run.
+    """
+    due = storage.get_base_orders_due_for_upsell(
+        min_days=settings.base_upsell_min_days,
+        max_days=settings.base_upsell_max_days,
+    )
+    counts = {"due": len(due), "sent": 0, "skipped": 0}
+
+    for row in due:
+        order_id = row["id"]
+        try:
+            intake = IntakeRequest.model_validate_json(row["intake_json"])
+            first_name = intake.first_name
+            email = intake.email
+        except Exception:
+            # Intake malformato/anonimizzato → non possiamo personalizzare: salta.
+            log.warning("[%s] upsell Base: intake illeggibile — skip", order_id)
+            counts["skipped"] += 1
+            continue
+
+        try:
+            resend_id = send_base_upsell_email(email=email, first_name=first_name)
+            storage.mark_base_upsell_sent(order_id)
+            counts["sent"] += 1
+            log.info("[%s] upsell Base→Completo inviato a %s (resend_id=%s)",
+                     order_id, email, resend_id)
+        except Exception:
+            # Non marchiamo: l'ordine resta idoneo al retry al prossimo sweep.
+            log.exception("[%s] invio upsell Base fallito per %s", order_id, email)
+            counts["skipped"] += 1
+    return counts
+
+
 def run() -> dict[str, int]:
     """
     Entry point dello sweep giornaliero (cron / endpoint admin).
 
-    Con il check-in gating, il cron NON genera più piani. Fa due cose:
+    Con il check-in gating, il cron NON genera più piani. Fa tre cose:
       1. Invia i solleciti di check-in dovuti (ogni 2 giorni, max 3).
       2. Backstop: apre un ciclo di check-in per i rinnovi il cui webhook è andato
          perso (next_plan_due_at scaduto e nessun ciclo aperto).
+      3. Upsell: invia l'email Base → Completo agli acquirenti Base a ~1 mese
+         dall'acquisto (una sola volta per ordine).
     La generazione del piano avviene quando il cliente completa il check-in.
 
     Ritorna i contatori del run.
@@ -341,13 +383,17 @@ def run() -> dict[str, int]:
 
     reminders = _send_due_reminders()
     backstop = _open_missed_checkins()
-    log.info("Check-in in attesa: %d, solleciti inviati: %d | backstop aperti: %d",
-             reminders["awaiting"], reminders["reminded"], backstop["opened"])
+    upsells = _send_base_upsells()
+    log.info("Check-in in attesa: %d, solleciti inviati: %d | backstop aperti: %d | "
+             "upsell Base inviati: %d/%d",
+             reminders["awaiting"], reminders["reminded"], backstop["opened"],
+             upsells["sent"], upsells["due"])
 
     counts = {
         "awaiting_checkin": reminders["awaiting"],
         "reminders_sent": reminders["reminded"],
         "backstop_opened": backstop["opened"],
+        "base_upsells_sent": upsells["sent"],
     }
 
     # ── Affiliate: promuovi le commissioni mature ────────────────────────

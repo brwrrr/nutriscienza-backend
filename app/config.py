@@ -21,6 +21,19 @@ class Settings(BaseSettings):
     from_email: str = "NutriScienza <piani@nutriscienza.org>"
     support_email: str = "supporto@nutriscienza.org"
 
+    # Upsell Base → Completo (email automatica ~1 mese dopo l'acquisto Base)
+    # Per attivare lo sconto "primo mese a €24": crea una Promotion Code su Stripe
+    # (es. €5 off, first invoice only, once per customer) e metti QUI il CODICE che
+    # il cliente digita al checkout (non il promo_..._id). Se vuoto, l'email NON
+    # menziona lo sconto e propone il Completo a prezzo pieno.
+    base_upsell_promo_code: str = ""       # es. "RICALCOLO24"
+    base_upsell_offer_price: str = "24"    # prezzo scontato primo mese (€)
+    base_upsell_full_price: str = "29"     # prezzo pieno Completo (€)
+    # Finestra di invio (giorni dall'acquisto). Il cron gira ogni giorno: l'ampiezza
+    # 30–45 garantisce copertura anche se un run salta, senza mai ri-inviare.
+    base_upsell_min_days: int = 30
+    base_upsell_max_days: int = 45
+
     # App
     base_url: str = "https://nutriscienza.org"
     database_path: str = "./data/orders.db"

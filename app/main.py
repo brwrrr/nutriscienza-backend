@@ -34,7 +34,12 @@ from slowapi.util import get_remote_address
 
 from . import affiliate, scheduler, storage
 from .config import settings
-from .email_sender import send_admin_failure, send_cancellation_email, send_plan_email
+from .email_sender import (
+    send_admin_failure,
+    send_base_upsell_email,
+    send_cancellation_email,
+    send_plan_email,
+)
 from .models import IntakeRequest
 from .nutrition import compute_targets
 from .pdf_builder import build_pdf
@@ -842,10 +847,32 @@ def admin_customer_profile(email: str):
             "created_at": o["created_at"],
         })
 
+    # ── Upsell Base → Completo ──
+    # Individua l'ordine Base pagato più recente (già ordinati per created_at DESC)
+    # e riporta lo stato dell'email di upsell. Se il cliente è già abbonato attivo,
+    # l'upsell non è pertinente (non lo si ricontatta).
+    latest_base = next(
+        (o for o in orders
+         if o["plan_chosen"] == "base"
+         and o["status"] in ("paid", "generating", "sent")
+         and not o["anonymized_at"]),
+        None,
+    )
+    is_active_sub = any(s["subscription_status"] in ("active", "past_due") for s in subs)
+    base_upsell = {
+        "eligible": latest_base is not None and not is_active_sub,
+        "has_base_order": latest_base is not None,
+        "is_active_subscriber": is_active_sub,
+        "order_id": latest_base["id"] if latest_base else None,
+        "sent_at": latest_base["base_upsell_sent_at"] if latest_base else None,
+        "purchase_date": latest_base["created_at"] if latest_base else None,
+    }
+
     return {
         "email": email,
         "first_name": first_name,
         "profile": profile or {},
+        "base_upsell": base_upsell,
         "orders": [{
             "id": o["id"], "plan": o["plan_chosen"], "status": o["status"],
             "created_at": o["created_at"], "updated_at": o["updated_at"],
@@ -854,6 +881,7 @@ def admin_customer_profile(email: str):
             "utm_source": o["utm_source"], "utm_medium": o["utm_medium"],
             "utm_campaign": o["utm_campaign"], "referrer": o["referrer"],
             "anonymized": bool(o["anonymized_at"]),
+            "base_upsell_sent_at": o["base_upsell_sent_at"],
         } for o in orders],
         "subscribers": [{
             "id": s["id"], "plan": s["plan"], "status": s["subscription_status"],
@@ -927,6 +955,52 @@ def admin_customer_force_plan(email: str, background_tasks: BackgroundTasks):
     storage.update_status(target["id"], "paid")
     background_tasks.add_task(_run_generation_pipeline, target["id"])
     return {"queued": True, "mode": "order_regenerate", "order_id": target["id"]}
+
+
+@app.post("/api/admin/customers/{email}/send-upsell", dependencies=[Depends(require_admin)])
+def admin_customer_send_upsell(email: str):
+    """
+    Invio MANUALE dell'email di upsell Base → Completo per l'ordine Base pagato più
+    recente del cliente. Bypassa la finestra 30–45 giorni (è un override intenzionale
+    dell'admin) e funziona anche se lo sweep automatico l'ha già inviata (re-invio).
+    Rifiuta solo se non c'è un ordine Base pagato o se il cliente è già abbonato attivo.
+    """
+    orders = storage.get_customer_orders(email)
+    subs = storage.get_customer_subscribers(email)
+    if any(s["subscription_status"] in ("active", "past_due") for s in subs):
+        raise HTTPException(
+            status_code=400,
+            detail="Il cliente ha già un abbonamento attivo — l'upsell non è pertinente.",
+        )
+    base = next(
+        (o for o in orders
+         if o["plan_chosen"] == "base"
+         and o["status"] in ("paid", "generating", "sent")
+         and not o["anonymized_at"]),
+        None,
+    )
+    if base is None:
+        raise HTTPException(status_code=400, detail="Nessun ordine Base pagato per questo cliente.")
+
+    was_already_sent = bool(base["base_upsell_sent_at"])
+    try:
+        intake = IntakeRequest.model_validate_json(base["intake_json"])
+    except Exception:
+        raise HTTPException(status_code=400, detail="Intake illeggibile — impossibile personalizzare l'email.")
+
+    try:
+        resend_id = send_base_upsell_email(email=intake.email, first_name=intake.first_name)
+    except Exception as exc:
+        log.exception("Invio upsell manuale fallito per %s", email)
+        raise HTTPException(status_code=502, detail=f"Invio email fallito: {exc}")
+
+    storage.mark_base_upsell_sent(base["id"])
+    return {
+        "sent": True,
+        "order_id": base["id"],
+        "was_already_sent": was_already_sent,
+        "resend_id": resend_id,
+    }
 
 
 @app.delete("/api/admin/customers/{email}", dependencies=[Depends(require_admin)])

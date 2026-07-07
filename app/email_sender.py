@@ -349,6 +349,102 @@ def send_cancellation_email(email: str, first_name: str, plan: str) -> None:
         pass  # non blocca il flusso principale
 
 
+def _base_upsell_html(first_name: str, checkout_url: str) -> str:
+    """
+    Email "il tuo piano ha una data di scadenza": inviata ~1 mese dopo l'acquisto
+    del Piano Base per proporre l'upgrade al Piano Completo (che ricalcola tutto
+    ogni mese). Stessa shell brandizzata delle altre transazionali.
+    """
+    promo = settings.base_upsell_promo_code.strip()
+    offer = settings.base_upsell_offer_price
+    full = settings.base_upsell_full_price
+
+    if promo:
+        # Con codice sconto attivo: prezzo civetta + codice da inserire al checkout.
+        offer_block = f"""
+      <div style="background:#FBF6EA;border:1px solid #E8D9B5;border-radius:8px;padding:18px 20px;margin:24px 0;text-align:center;">
+        <p style="margin:0 0 6px;font-size:15px;color:#2A2A2A;">Solo per te, primo mese a</p>
+        <p style="margin:0 0 8px;font-family:Georgia,serif;font-size:32px;color:#2D5F3F;font-weight:700;line-height:1;">
+          €{offer} <span style="font-size:17px;color:#A88349;text-decoration:line-through;font-weight:400;">€{full}</span>
+        </p>
+        <p style="margin:0;font-size:14px;color:#6B6B6B;">
+          Inserisci il codice <strong style="color:#2D5F3F;letter-spacing:1px;">{promo}</strong> al checkout.
+        </p>
+      </div>"""
+        cta_label = "Attiva il Piano Completo →"
+    else:
+        offer_block = ""
+        cta_label = "Passa al Piano Completo →"
+
+    return f"""\
+<!DOCTYPE html>
+<html lang="it">
+<head><meta charset="UTF-8"></head>
+<body style="font-family:-apple-system,Segoe UI,Inter,sans-serif;background:#FBF9F4;margin:0;padding:24px;color:#2A2A2A;">
+  <div style="max-width:560px;margin:0 auto;background:white;border-radius:12px;overflow:hidden;border:1px solid #E5E0D3;">
+    <div style="background:#2D5F3F;padding:6px 0;"></div>
+    <div style="padding:32px 36px 28px;">
+      <div style="font-family:Georgia,serif;font-size:22px;font-weight:700;color:#2D5F3F;margin-bottom:6px;">
+        Nutri<span style="color:#C9A66B;">Scienza</span>
+      </div>
+      <p style="font-size:11px;letter-spacing:1.5px;text-transform:uppercase;color:#A88349;font-weight:700;margin:24px 0 8px;">
+        Il tuo piano ha una data di scadenza
+      </p>
+      <h1 style="font-family:Georgia,serif;font-size:27px;color:#2D5F3F;margin:0 0 16px;line-height:1.25;">
+        Ciao {first_name}, i tuoi dati sono già cambiati.
+      </h1>
+      <p style="font-size:15px;line-height:1.6;color:#2A2A2A;">
+        Il piano che hai ricevuto è calibrato sui dati di un mese fa. Se stai vedendo
+        risultati — peso, energia, misure — quei numeri sono già cambiati. Un piano
+        costruito su dati vecchi perde precisione ogni settimana.
+      </p>
+      <p style="font-size:15px;line-height:1.6;color:#2A2A2A;">
+        Il <strong>Piano Completo</strong> ricalcola tutto ogni mese: nuovo fabbisogno,
+        nuovo deficit, nuovo piano. Stessi principi scientifici, dati sempre aggiornati.
+      </p>{offer_block}
+      <div style="text-align:center;margin:26px 0;">
+        <a href="{checkout_url}" style="display:inline-block;background:#2D5F3F;color:white;padding:14px 32px;border-radius:8px;font-weight:700;text-decoration:none;font-size:16px;">
+          {cta_label}
+        </a>
+      </div>
+      <p style="font-size:14px;color:#6B6B6B;line-height:1.6;">
+        Hai domande? Rispondi a questa email o scrivici a
+        <a href="mailto:{settings.support_email}" style="color:#2D5F3F;">{settings.support_email}</a>.
+      </p>
+      <hr style="border:none;border-top:1px solid #E5E0D3;margin:28px 0 18px;">
+      <p style="font-size:12px;color:#6B6B6B;line-height:1.5;">
+        Ricevi questa email perché hai acquistato un Piano Base su NutriScienza.
+        È l'unico messaggio di questo tipo che ti inviamo. Il Piano Completo è un
+        abbonamento mensile, disdicibile in qualsiasi momento.
+      </p>
+    </div>
+    <div style="background:#1A2E22;padding:18px 36px;color:rgba(255,255,255,0.7);font-size:12px;">
+      © NutriScienza · <a href="{settings.base_url}" style="color:#C9A66B;text-decoration:none;">nutriscienza.org</a>
+    </div>
+  </div>
+</body>
+</html>"""
+
+
+def send_base_upsell_email(email: str, first_name: str) -> str:
+    """
+    Invia l'email di upsell Base → Completo. Ritorna l'id Resend.
+    Solleva eccezione se l'invio fallisce (il chiamante NON marca l'invio,
+    così il subscriber resta idoneo al retry al prossimo run).
+    """
+    checkout_url = (
+        f"{settings.base_url}/questionario.html"
+        f"?utm_source=email&utm_medium=lifecycle&utm_campaign=base_upsell"
+    )
+    response = resend.Emails.send({
+        "from": settings.from_email,
+        "to": [email],
+        "subject": f"{first_name}, il tuo piano ha una data di scadenza 🌿",
+        "html": _base_upsell_html(first_name, checkout_url),
+    })
+    return response["id"]
+
+
 def send_admin_failure(order_id: str, error: str) -> None:
     """Notifica interna se la generazione fallisce."""
     try:
