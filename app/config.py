@@ -8,6 +8,14 @@ class Settings(BaseSettings):
     # Stripe
     stripe_secret_key: str
     stripe_webhook_secret: str
+    # Signing secret dell'endpoint webhook in TEST MODE (sandbox). Test e live
+    # hanno whsec_ diversi: senza questo, gli eventi test falliscono la firma (400)
+    # e Stripe disabilita l'endpoint. Vuoto = eventi test rifiutati come prima.
+    stripe_webhook_secret_test: str = ""
+    # Se True, gli eventi test mode vengono PROCESSATI (ordini/subscriber di test
+    # finiscono nel DB di produzione!). Default False: firma verificata, 200 a
+    # Stripe, ma nessun effetto sul DB. Attivare solo durante test end-to-end.
+    process_test_events: bool = False
     stripe_price_base: str
     stripe_price_completo: str
     stripe_price_coach: str

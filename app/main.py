@@ -192,7 +192,17 @@ async def stripe_webhook(
         log.warning("Webhook firma invalida: %s", e)
         raise HTTPException(status_code=400, detail="Firma non valida")
 
-    log.info("Stripe event: %s (id=%s)", event["type"], event["id"])
+    log.info("Stripe event: %s (id=%s, livemode=%s)",
+             event["type"], event["id"], event.get("livemode"))
+
+    # ── Guardia test mode ──────────────────────────────────────────────────
+    # Gli eventi sandbox/test firmano correttamente (secret test) ma NON devono
+    # toccare il DB di produzione: rispondiamo 200 (così Stripe non disabilita
+    # l'endpoint) e usciamo. PROCESS_TEST_EVENTS=true per test end-to-end.
+    if not event.get("livemode", False) and not settings.process_test_events:
+        log.info("Evento test mode ricevuto e ignorato: %s (id=%s)",
+                 event["type"], event["id"])
+        return {"received": True, "ignored": "test_mode"}
 
     if event["type"] == "checkout.session.completed":
         session: dict[str, Any] = event["data"]["object"]
@@ -332,18 +342,6 @@ async def stripe_webhook(
                     first_name=sub_row["first_name"],
                     plan=sub_row["plan"],
                 )
-
-    elif event["type"] == "charge.refunded":
-        # Reversal commissioni affiliate — best effort, mai blocca.
-        try:
-            charge: dict[str, Any] = event["data"]["object"]
-            invoice_id = charge.get("invoice")
-            charge_id = charge.get("id")
-            n = affiliate.reverse_commission_for_charge(invoice_id, charge_id)
-            if n:
-                log.info("Reversed %d commission(s) per charge=%s", n, charge_id)
-        except Exception:
-            log.exception("Reversal commissioni fallito — ignorato")
 
     return {"received": True}
 

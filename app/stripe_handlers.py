@@ -61,10 +61,22 @@ def create_checkout_session(
 
 
 def verify_webhook(payload: bytes, sig_header: str) -> stripe.Event:
-    """Verifica la firma del webhook e ritorna l'evento parsato."""
-    return stripe.Webhook.construct_event(
-        payload, sig_header, settings.stripe_webhook_secret
-    )
+    """
+    Verifica la firma del webhook e ritorna l'evento parsato.
+
+    Prova prima il secret live, poi quello test (se configurato): test mode e
+    live mode firmano con whsec_ diversi, e lo stesso endpoint riceve entrambi.
+    """
+    secrets = [
+        s for s in (settings.stripe_webhook_secret, settings.stripe_webhook_secret_test) if s
+    ]
+    last_err: Exception | None = None
+    for secret in secrets:
+        try:
+            return stripe.Webhook.construct_event(payload, sig_header, secret)
+        except stripe.error.SignatureVerificationError as e:
+            last_err = e
+    raise last_err or ValueError("Nessun webhook secret configurato")
 
 
 def create_portal_session(customer_id: str, return_url: str) -> stripe.billing_portal.Session:
