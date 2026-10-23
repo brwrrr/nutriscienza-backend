@@ -153,6 +153,7 @@ def intake(request: Request, payload: IntakeRequest):
         session = create_checkout_session(
             order_id, payload.plan, payload.email,
             affiliate_ref=validated_ref,
+            promo_code=payload.promo_code,
         )
     except stripe.error.StripeError as e:
         log.exception("Stripe checkout fallito per ordine %s", order_id)

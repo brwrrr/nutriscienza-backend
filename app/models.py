@@ -50,6 +50,10 @@ class IntakeRequest(BaseModel):
     # in landing page e propagato al checkout. Nessun impatto se assente.
     affiliate_ref: Optional[str] = Field(default=None, alias="affiliateRef", max_length=40)
 
+    # Codice promo dal link dell'email upsell (?promo=). Applicato server-side SOLO se
+    # coincide con settings.base_upsell_promo_code e il piano è "completo".
+    promo_code: Optional[str] = Field(default=None, alias="promoCode", max_length=40)
+
     # Consensi GDPR (art. 9 dati salute + Termini/maggiore età). Default False per
     # compatibilità con gli ordini già salvati; obbligatori su /api/intake (main.py).
     # consent_at è fissato dal SERVER: prova del consenso (art. 7.1), salvata in intake_json.

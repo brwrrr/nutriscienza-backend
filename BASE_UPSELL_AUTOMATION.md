@@ -36,26 +36,33 @@ Vengono inclusi solo gli ordini che soddisfano **tutti** questi criteri:
 
 ---
 
-## ⚠️ Unico passo manuale: creare il codice sconto su Stripe
+## ⚠️ Setup Stripe + Render (obbligatorio per garantire i €24)
 
-Per far funzionare davvero l'offerta "€24 invece di €29":
+1. Stripe → **Product catalogue → Coupons → New**:
+   - Tipo **Fixed amount €5**, valuta EUR
+   - **Duration: Once** ← critico: con "Forever" ogni mese sarebbe €24 (−€60/anno/cliente)
+   - **Apply to specific products: solo "Piano Completo"** (altrimenti vale anche su Base/Coach)
+   - Redemption limits: **data di scadenza** + **max redemptions** (es. 500)
+2. Sul coupon → **Promotion codes → Add**: codice `RICALCOLO24`.
+   - **NON** spuntare "First-time order only": gli acquirenti Base hanno già pagato e
+     verrebbero rifiutati.
+   - "Once per customer" NON è efficace: il checkout usa `customer_email`, quindi ogni
+     checkout crea un nuovo Customer Stripe. La protezione reale è scadenza + cap + vincolo prodotto.
+3. Render → servizio backend → **Environment**: `BASE_UPSELL_PROMO_CODE=RICALCOLO24` → Save (redeploy).
+4. Test in test-mode: prima fattura €24, seconda €29.
 
-1. Stripe Dashboard → **Products → Coupons → New** → es. **€5 off**, durata *"Once"*
-   (si applica solo alla prima fattura).
-2. Crea una **Promotion Code** collegata a quel coupon, es. codice `RICALCOLO24`
-   (consigliato: *Limit to first-time / once per customer*).
-3. Imposta la variabile d'ambiente su Render:
-   ```
-   base_upsell_promo_code=RICALCOLO24
-   ```
+### Come viene applicato (aggiornamento 2026-10-23)
+- Il link dell'email è `questionario.html?piano=completo&promo=RICALCOLO24&utm_...`:
+  il Completo è pre-selezionato e il codice viaggia nel payload (`promoCode`).
+- Il backend (`stripe_handlers._discount_params`) applica lo sconto **automaticamente**
+  via `discounts=[{promotion_code}]` solo se il codice coincide con
+  `BASE_UPSELL_PROMO_CODE` e il piano è `completo`. Il cliente non deve digitare nulla.
+- Se il codice non coincide, il piano è un altro, o il lookup Stripe fallisce →
+  fallback a `allow_promotion_codes=True` (checkout mai bloccato).
+- L'email ora dice "Sconto già applicato dal pulsante qui sotto".
 
-Il checkout ha già `allow_promotion_codes=True`, quindi il cliente digita il codice
-nella pagina di pagamento Stripe.
-
-**Se `base_upsell_promo_code` è vuoto** (default): l'email viene comunque inviata, ma
-**senza** il prezzo scontato — propone il Completo a prezzo pieno con una CTA neutra.
-Così il sistema è sicuro anche prima che tu crei il codice (nessun cliente vede un
-codice "non valido").
+**Se `BASE_UPSELL_PROMO_CODE` è vuoto**: l'email viene inviata a prezzo pieno, senza
+codice né prezzo barrato (nessun cliente vede un codice non valido).
 
 ---
 

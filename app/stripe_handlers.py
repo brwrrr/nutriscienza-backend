@@ -30,6 +30,7 @@ def create_checkout_session(
     plan: Plan,
     email: str,
     affiliate_ref: str | None = None,
+    promo_code: str | None = None,
 ) -> stripe.checkout.Session:
     """Crea una Stripe Checkout Session per l'ordine."""
     price_id = settings.price_id_for_plan[plan]
@@ -55,9 +56,30 @@ def create_checkout_session(
         ),
         locale="it",
         billing_address_collection="auto",
-        allow_promotion_codes=True,
+        # Stripe non accetta discounts + allow_promotion_codes insieme:
+        # se lo sconto upsell è pre-applicato, il campo codice manuale sparisce.
+        **_discount_params(plan, promo_code),
     )
     return session
+
+
+def _discount_params(plan: str, promo_code: str | None) -> dict:
+    """
+    Pre-applica lo sconto upsell (es. RICALCOLO24 = primo mese €24) quando il
+    cliente arriva dal link dell'email. Whitelist: solo il codice configurato e
+    solo sul Piano Completo — un ?promo= arbitrario non sblocca nulla.
+    Se il lookup fallisce, fallback al campo codice manuale: il checkout non si blocca mai.
+    """
+    configured = settings.base_upsell_promo_code.strip().upper()
+    code = (promo_code or "").strip().upper()
+    if configured and code == configured and plan == "completo":
+        try:
+            found = stripe.PromotionCode.list(code=configured, active=True, limit=1)
+            if found.data:
+                return {"discounts": [{"promotion_code": found.data[0].id}]}
+        except stripe.error.StripeError:
+            pass
+    return {"allow_promotion_codes": True}
 
 
 def verify_webhook(payload: bytes, sig_header: str) -> stripe.Event:

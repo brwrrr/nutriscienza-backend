@@ -368,7 +368,7 @@ def _base_upsell_html(first_name: str, checkout_url: str) -> str:
           €{offer} <span style="font-size:17px;color:#A88349;text-decoration:line-through;font-weight:400;">€{full}</span>
         </p>
         <p style="margin:0;font-size:14px;color:#6B6B6B;">
-          Inserisci il codice <strong style="color:#2D5F3F;letter-spacing:1px;">{promo}</strong> al checkout.
+          Sconto già applicato dal pulsante qui sotto (codice <strong style="color:#2D5F3F;letter-spacing:1px;">{promo}</strong>).
         </p>
       </div>"""
         cta_label = "Attiva il Piano Completo →"
@@ -433,9 +433,11 @@ def send_base_upsell_email(email: str, first_name: str) -> str:
     Solleva eccezione se l'invio fallisce (il chiamante NON marca l'invio,
     così il subscriber resta idoneo al retry al prossimo run).
     """
+    promo = settings.base_upsell_promo_code.strip()
     checkout_url = (
-        f"{settings.base_url}/questionario.html"
-        f"?utm_source=email&utm_medium=lifecycle&utm_campaign=base_upsell"
+        f"{settings.base_url}/questionario.html?piano=completo"
+        + (f"&promo={promo}" if promo else "")
+        + "&utm_source=email&utm_medium=lifecycle&utm_campaign=base_upsell"
     )
     response = resend.Emails.send({
         "from": settings.from_email,
