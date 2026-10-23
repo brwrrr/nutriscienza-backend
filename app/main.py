@@ -122,6 +122,14 @@ def intake(request: Request, payload: IntakeRequest):
     Riceve il questionario completato, calcola i target nutrizionali, crea l'ordine
     e una Checkout Session Stripe. Ritorna l'URL del checkout.
     """
+    # Consensi obbligatori: dati di salute (art. 9.2.a GDPR) + Termini/maggiore età.
+    from datetime import datetime as _dt, timezone as _tz
+    if not (payload.health_consent and payload.terms_accepted):
+        raise HTTPException(status_code=422, detail="Per continuare è necessario accettare i due consensi.")
+    if payload.age < 18:
+        raise HTTPException(status_code=422, detail="Il servizio è riservato ai maggiorenni.")
+    payload.consent_at = _dt.now(_tz.utc).isoformat(timespec="seconds")
+
     targets = compute_targets(payload)
 
     # Validazione ref affiliate. Se invalido o disattivato, lo droppiamo

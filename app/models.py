@@ -50,6 +50,14 @@ class IntakeRequest(BaseModel):
     # in landing page e propagato al checkout. Nessun impatto se assente.
     affiliate_ref: Optional[str] = Field(default=None, alias="affiliateRef", max_length=40)
 
+    # Consensi GDPR (art. 9 dati salute + Termini/maggiore età). Default False per
+    # compatibilità con gli ordini già salvati; obbligatori su /api/intake (main.py).
+    # consent_at è fissato dal SERVER: prova del consenso (art. 7.1), salvata in intake_json.
+    health_consent: bool = Field(default=False, alias="healthConsent")
+    terms_accepted: bool = Field(default=False, alias="termsAccepted")
+    consent_version: Optional[str] = Field(default=None, alias="consentVersion", max_length=40)
+    consent_at: Optional[str] = Field(default=None, alias="consentAt", max_length=40)
+
     # Attribuzione traffico — opzionale. Catturati first-touch dal frontend
     # (utm_* + referrer + landing page). Servono per capire dove investire in promo.
     # Nessun impatto sul flusso se assenti.

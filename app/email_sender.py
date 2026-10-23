@@ -419,6 +419,7 @@ def _base_upsell_html(first_name: str, checkout_url: str) -> str:
       </p>
     </div>
     <div style="background:#1A2E22;padding:18px 36px;color:rgba(255,255,255,0.7);font-size:12px;">
+      Ricevi questa email perché hai acquistato il Piano Base. Non vuoi altre proposte? Rispondi <strong>STOP</strong> e non te ne invieremo più.<br><br>
       © NutriScienza · <a href="{settings.base_url}" style="color:#C9A66B;text-decoration:none;">nutriscienza.org</a>
     </div>
   </div>
