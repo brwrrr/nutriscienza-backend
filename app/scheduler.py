@@ -396,6 +396,16 @@ def run() -> dict[str, int]:
         "base_upsells_sent": upsells["sent"],
     }
 
+    # ── Lead magnet: sequenza email (solo con consenso marketing) ─────────
+    try:
+        from . import leads as _leads
+        nurture = _leads.send_due_nurture()
+        counts["lead_nurture_sent"] = nurture["sent"]
+        log.info("Email sequenza guida inviate: %d/%d", nurture["sent"], nurture["due"])
+    except Exception:
+        log.exception("Sequenza email guida fallita — ignorata")
+        counts["lead_nurture_sent"] = 0
+
     # ── Affiliate: promuovi le commissioni mature ────────────────────────
     # Pending → approved per quelle col payable_at scaduto (30gg di hold).
     # Best-effort: un fallimento qui non deve compromettere il run principale.

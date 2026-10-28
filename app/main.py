@@ -25,14 +25,14 @@ import sentry_sdk
 import stripe
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr, Field
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
-from . import affiliate, scheduler, storage
+from . import affiliate, leads, scheduler, storage
 from .config import settings
 from .email_sender import (
     send_admin_failure,
@@ -96,6 +96,7 @@ app.add_middleware(
 @app.on_event("startup")
 def on_startup():
     storage.init_db()
+    leads.init()
     # IMPORTANTE: usa il path configurato (disco persistente in prod), NON un
     # path relativo hardcoded. Su Render il filesystem è effimero: senza disco
     # montato su questo path i PDF spariscono ad ogni redeploy (vedi DEPLOY.md).
@@ -174,6 +175,62 @@ def intake(request: Request, payload: IntakeRequest):
             "fat_g": targets.fat_g,
         },
     }
+
+
+# ---------- Lead magnet (guida gratuita) ----------
+
+class LeadRequest(BaseModel):
+    email: EmailStr
+    marketing_consent: bool = Field(default=False, alias="marketingConsent")
+    consent_version: str | None = Field(default=None, alias="consentVersion", max_length=40)
+    guide: str = Field(default="ordine-dei-cibi", max_length=40)
+    utm_source: str | None = Field(default=None, alias="utmSource", max_length=100)
+    utm_medium: str | None = Field(default=None, alias="utmMedium", max_length=100)
+    utm_campaign: str | None = Field(default=None, alias="utmCampaign", max_length=100)
+    referrer: str | None = Field(default=None, max_length=400)
+    landing_page: str | None = Field(default=None, alias="landingPage", max_length=400)
+
+
+def _deliver_guide(lead_id: str, email: str) -> None:
+    try:
+        row = leads.upsert_lead(email, "ordine-dei-cibi", False, None, {})  # rilegge senza modificare
+        rid = leads.send_guide_email(row)
+        leads.mark_guide_sent(lead_id)
+        log.info("[lead %s] guida inviata (resend_id=%s)", lead_id, rid)
+    except Exception:
+        log.exception("[lead %s] invio guida fallito", lead_id)
+
+
+@app.post("/api/lead")
+@limiter.limit("5/minute")
+def create_lead(request: Request, payload: LeadRequest, background_tasks: BackgroundTasks):
+    """Richiesta della guida gratuita. Il consenso marketing è facoltativo e separato."""
+    traffic = {
+        "utm_source": payload.utm_source, "utm_medium": payload.utm_medium,
+        "utm_campaign": payload.utm_campaign, "referrer": payload.referrer,
+        "landing_page": payload.landing_page,
+    }
+    row = leads.upsert_lead(payload.email, payload.guide, payload.marketing_consent,
+                            payload.consent_version, traffic)
+    background_tasks.add_task(_deliver_guide, row["id"], row["email"])
+    return {"ok": True}
+
+
+@app.get("/api/unsubscribe/{token}", response_class=HTMLResponse)
+@app.post("/api/unsubscribe/{token}", response_class=HTMLResponse)
+def unsubscribe(token: str):
+    """Disiscrizione con un clic (link nelle email e header List-Unsubscribe-Post)."""
+    ok = leads.unsubscribe(token)
+    msg = ("Fatto: non riceverai più email promozionali da NutriScienza."
+           if ok else "Link non valido o già utilizzato. Per assistenza scrivi a " + settings.support_email + ".")
+    return HTMLResponse(
+        "<!DOCTYPE html><html lang='it'><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<title>Disiscrizione — NutriScienza</title></head>"
+        "<body style=\"font-family:-apple-system,Segoe UI,sans-serif;background:#FBF9F4;color:#2A2A2A;padding:48px 20px;text-align:center\">"
+        "<div style=\"font-family:Georgia,serif;font-size:24px;font-weight:700;color:#2D5F3F\">Nutri<span style='color:#C9A66B'>Scienza</span></div>"
+        f"<p style='font-size:17px;max-width:460px;margin:24px auto'>{msg}</p>"
+        f"<a href='{settings.base_url}' style='color:#2D5F3F'>Torna al sito</a></body></html>"
+    )
 
 
 # ---------- Stripe webhook ----------
@@ -1018,6 +1075,10 @@ def admin_customer_gdpr_delete(email: str):
     Rimuove i PDF dal disco. Irreversibile.
     """
     result = storage.gdpr_delete_customer(email)
+    try:
+        leads.delete_lead(email)
+    except Exception:
+        log.exception("Cancellazione lead GDPR fallita: %s", email)
     for p in result.get("pdf_paths", []):
         try:
             Path(p).unlink(missing_ok=True)
@@ -1047,10 +1108,16 @@ def admin_traffic():
     totals = storage.traffic_totals()
     for r in by_source:
         r["conversion_pct"] = round((r["paid"] / r["signups"]) * 100, 1) if r["signups"] else 0.0
+    try:
+        lead_rows = [dict(r) for r in leads.leads_by_source()]
+    except Exception:
+        log.exception("Aggregato lead fallito")
+        lead_rows = []
     return {
         "totals": totals,
         "by_source": by_source,
         "by_referrer": by_referrer,
+        "leads_by_source": lead_rows,
     }
 
 
