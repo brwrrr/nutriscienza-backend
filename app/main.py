@@ -25,7 +25,7 @@ import sentry_sdk
 import stripe
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, EmailStr, Field
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -214,6 +214,20 @@ def create_lead(request: Request, payload: LeadRequest, background_tasks: Backgr
                             payload.consent_version, traffic)
     background_tasks.add_task(_deliver_guide, row["id"], row["email"])
     return {"ok": True}
+
+
+@app.get("/api/guide/{guide}/download")
+@limiter.limit("30/minute")
+def guide_download(request: Request, guide: str, c: str = "pagina"):
+    """Conta il download (aggregato, anonimo) e reindirizza al PDF statico."""
+    path = leads.GUIDES.get(guide)
+    if not path:
+        raise HTTPException(status_code=404, detail="Guida non trovata")
+    try:
+        leads.record_download(guide, c)
+    except Exception:
+        log.exception("Conteggio download guida fallito")  # il download non deve mai fallire
+    return RedirectResponse(url=f"{settings.base_url}{path}", status_code=302)
 
 
 @app.get("/api/unsubscribe/{token}", response_class=HTMLResponse)
@@ -1110,14 +1124,16 @@ def admin_traffic():
         r["conversion_pct"] = round((r["paid"] / r["signups"]) * 100, 1) if r["signups"] else 0.0
     try:
         lead_rows = [dict(r) for r in leads.leads_by_source()]
+        guide_stats = leads.download_stats()
     except Exception:
         log.exception("Aggregato lead fallito")
-        lead_rows = []
+        lead_rows, guide_stats = [], {}
     return {
         "totals": totals,
         "by_source": by_source,
         "by_referrer": by_referrer,
         "leads_by_source": lead_rows,
+        "guide": guide_stats,
     }
 
 

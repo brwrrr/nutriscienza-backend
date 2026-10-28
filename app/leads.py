@@ -25,7 +25,7 @@ from .storage import _conn, _now_iso
 
 log = logging.getLogger("nutriscienza.leads")
 
-GUIDE_URL_PATH = "/guide/guida-ordine-dei-cibi.pdf"
+GUIDE_URL_PATH = "/guide/guida-ordine-dei-cibi.pdf"  # file statico servito dal frontend
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS leads (
@@ -49,7 +49,20 @@ CREATE TABLE IF NOT EXISTS leads (
     updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_leads_token ON leads(unsub_token);
+
+-- Contatore download PDF: solo aggregati giornalieri per canale, nessun dato personale.
+CREATE TABLE IF NOT EXISTS guide_downloads (
+    day TEXT NOT NULL,
+    guide TEXT NOT NULL,
+    channel TEXT NOT NULL,
+    count INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (day, guide, channel)
+);
 """
+
+# Guide scaricabili: nome → path pubblico del PDF. Solo questi sono contati/reindirizzati.
+GUIDES = {"ordine-dei-cibi": "/guide/guida-ordine-dei-cibi.pdf"}
+DOWNLOAD_CHANNELS = ("email", "pagina")
 
 # (step da inviare, giorni minimi dalla richiesta)
 NURTURE_SCHEDULE = [(1, 2), (2, 5), (3, 9)]
@@ -164,6 +177,38 @@ def leads_by_source() -> list[sqlite3.Row]:
         ).fetchall()
 
 
+def record_download(guide: str, channel: str) -> None:
+    init()
+    if channel not in DOWNLOAD_CHANNELS:
+        channel = "altro"
+    day = datetime.now(timezone.utc).date().isoformat()
+    with _conn() as c:
+        c.execute(
+            """INSERT INTO guide_downloads (day, guide, channel, count) VALUES (?,?,?,1)
+               ON CONFLICT(day, guide, channel) DO UPDATE SET count = count + 1""",
+            (day, guide, channel),
+        )
+
+
+def download_stats() -> dict:
+    """Totali download per canale + ultimi 7 giorni, e richieste guida per confronto."""
+    init()
+    since7 = (datetime.now(timezone.utc).date() - timedelta(days=6)).isoformat()
+    with _conn() as c:
+        by_channel = {r["channel"]: r["n"] for r in c.execute(
+            "SELECT channel, SUM(count) AS n FROM guide_downloads GROUP BY channel")}
+        last7 = c.execute("SELECT COALESCE(SUM(count),0) FROM guide_downloads WHERE day >= ?", (since7,)).fetchone()[0]
+        lead_totals = c.execute(
+            "SELECT COUNT(*) AS leads, COALESCE(SUM(marketing_consent),0) AS opt_in FROM leads").fetchone()
+    return {
+        "total": sum(by_channel.values()),
+        "by_channel": by_channel,
+        "last_7_days": last7,
+        "guide_requests": lead_totals["leads"],
+        "marketing_opt_in": lead_totals["opt_in"],
+    }
+
+
 def delete_lead(email: str) -> int:
     """Cancellazione GDPR (art. 17)."""
     init()
@@ -232,7 +277,8 @@ def _send(row: sqlite3.Row, subject: str, html: str, marketing: bool) -> str:
 
 
 def send_guide_email(row: sqlite3.Row) -> str:
-    guide_url = f"{settings.base_url}{GUIDE_URL_PATH}"
+    # Passa dal backend per contare il download (poi redirect al PDF statico).
+    guide_url = f"{settings.api_base_url}/api/guide/ordine-dei-cibi/download?c=email"
     body = (
         _p("Ecco la guida che hai richiesto. Sono 5 pagine: cosa dicono gli studi sull'ordine dei cibi, "
            "la regola in 3 passi e come adattarla a pasta, pizza, colazione e aperitivo.")
