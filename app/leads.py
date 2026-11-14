@@ -177,6 +177,31 @@ def leads_by_source() -> list[sqlite3.Row]:
         ).fetchall()
 
 
+def leads_by_page() -> list[sqlite3.Row]:
+    """Richieste guida per pagina in cui è stato compilato il modulo (senza query string),
+    per capire quali pagine guida raccolgono email. Stessa logica acquirenti di leads_by_source."""
+    init()
+    with _conn() as c:
+        return c.execute(
+            f"""SELECT page, COUNT(*) AS leads, SUM(marketing_consent) AS marketing_opt_in,
+                       SUM(buyer) AS buyers, MAX(created_at) AS last_request
+                FROM (
+                    SELECT CASE
+                               WHEN l.landing_page IS NULL OR l.landing_page = '' THEN '(sconosciuta)'
+                               WHEN instr(l.landing_page, '?') > 0
+                                   THEN substr(l.landing_page, 1, instr(l.landing_page, '?') - 1)
+                               ELSE l.landing_page
+                           END AS page,
+                           l.marketing_consent, l.created_at,
+                           CASE WHEN EXISTS (SELECT 1 FROM orders o WHERE o.email = l.email
+                                             AND o.status IN {_PAID}) THEN 1 ELSE 0 END AS buyer
+                    FROM leads l
+                )
+                GROUP BY page
+                ORDER BY leads DESC"""
+        ).fetchall()
+
+
 def record_download(guide: str, channel: str) -> None:
     init()
     if channel not in DOWNLOAD_CHANNELS:

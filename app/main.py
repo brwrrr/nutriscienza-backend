@@ -1124,15 +1124,17 @@ def admin_traffic():
         r["conversion_pct"] = round((r["paid"] / r["signups"]) * 100, 1) if r["signups"] else 0.0
     try:
         lead_rows = [dict(r) for r in leads.leads_by_source()]
+        lead_pages = [dict(r) for r in leads.leads_by_page()]
         guide_stats = leads.download_stats()
     except Exception:
         log.exception("Aggregato lead fallito")
-        lead_rows, guide_stats = [], {}
+        lead_rows, lead_pages, guide_stats = [], [], {}
     return {
         "totals": totals,
         "by_source": by_source,
         "by_referrer": by_referrer,
         "leads_by_source": lead_rows,
+        "leads_by_page": lead_pages,
         "guide": guide_stats,
     }
 
